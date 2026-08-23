@@ -45,6 +45,65 @@ type Stats struct {
 	Pages            int
 }
 
+// KeyValidation summarizes the encrypted sample records successfully opened
+// before an output archive is created.
+type KeyValidation struct {
+	Records int
+	Pages   int
+}
+
+// ValidateBundleKey decrypts up to three independent encrypted records in
+// memory. This rejects a wrong or stale captured key before creating the
+// destination archive.
+func ValidateBundleKey(bundle string, key []byte) (validation KeyValidation, err error) {
+	entries, err := os.ReadDir(bundle)
+	if err != nil {
+		return validation, fmt.Errorf("read bundle: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	const sampleLimit = 3
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return validation, infoErr
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(bundle, entry.Name()))
+		if readErr != nil {
+			return validation, readErr
+		}
+		if !isDRMION(data) {
+			continue
+		}
+		values, parseErr := parseIon(data[len(drmIonPrefix) : len(data)-8])
+		if parseErr != nil {
+			return validation, fmt.Errorf("%s: parse DRMION sample: %w", entry.Name(), parseErr)
+		}
+		if !containsAnnotated(values, sidEncryptedPageV1, sidEncryptedPageV2) {
+			continue
+		}
+		plaintext, pages, decryptErr := DecryptRecord(data, key)
+		clear(plaintext)
+		if decryptErr != nil {
+			return validation, fmt.Errorf("%s: %w", entry.Name(), decryptErr)
+		}
+		validation.Records++
+		validation.Pages += pages
+		if validation.Records == sampleLimit {
+			break
+		}
+	}
+	if validation.Records == 0 {
+		return validation, errors.New("bundle contains no encrypted DRMION sample record")
+	}
+	return validation, nil
+}
+
 // DecryptRecord converts one complete DRMION record into its KFX payload.
 func DecryptRecord(record, key []byte) ([]byte, int, error) {
 	if len(key) < aes.BlockSize {
@@ -206,11 +265,6 @@ func containsAnnotated(values []*ionValue, ids ...uint64) bool {
 // DecryptBundle packages a Kindle download directory as a standalone,
 // unencrypted KFX ZIP. The destination must not already exist.
 func DecryptBundle(bundle, destination string, key []byte) (stats Stats, err error) {
-	entries, err := os.ReadDir(bundle)
-	if err != nil {
-		return stats, fmt.Errorf("read bundle: %w", err)
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 		return stats, err
 	}
@@ -225,7 +279,30 @@ func DecryptBundle(bundle, destination string, key []byte) (stats Stats, err err
 			_ = os.Remove(destination)
 		}
 	}()
-	writer := zip.NewWriter(file)
+	stats, err = DecryptBundleTo(bundle, file, key)
+	if err != nil {
+		return stats, err
+	}
+	if err := file.Sync(); err != nil {
+		return stats, err
+	}
+	if err := file.Close(); err != nil {
+		return stats, err
+	}
+	complete = true
+	return stats, nil
+}
+
+// DecryptBundleTo writes a standalone, unencrypted KFX ZIP to destination.
+// It enables callers to keep the intermediate archive in memory or stream it
+// through an anonymous pipe without creating a plaintext temporary file.
+func DecryptBundleTo(bundle string, destination io.Writer, key []byte) (stats Stats, err error) {
+	entries, err := os.ReadDir(bundle)
+	if err != nil {
+		return stats, fmt.Errorf("read bundle: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	writer := zip.NewWriter(destination)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -272,13 +349,6 @@ func DecryptBundle(bundle, destination string, key []byte) (stats Stats, err err
 	if err := writer.Close(); err != nil {
 		return stats, err
 	}
-	if err := file.Sync(); err != nil {
-		return stats, err
-	}
-	if err := file.Close(); err != nil {
-		return stats, err
-	}
-	complete = true
 	return stats, nil
 }
 

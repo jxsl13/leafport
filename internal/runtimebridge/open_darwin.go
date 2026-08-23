@@ -5,7 +5,6 @@ package runtimebridge
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -17,14 +16,44 @@ import (
 
 	"github.com/ebitengine/purego"
 	"github.com/ebitengine/purego/objc"
-	"howett.net/plist"
+	"golang.org/x/arch/arm64/arm64asm"
+
+	"leafport/internal/compatibility"
+	"leafport/internal/machoutil"
+	"leafport/internal/readerconfig"
 )
 
 const foundationPath = "/System/Library/Frameworks/Foundation.framework/Foundation"
 
+const inlineHookSize = 16
+
 type Capture struct {
-	Key  []byte
-	Uses int
+	Key          []byte
+	Uses         int
+	Profile      string
+	KnownProfile bool
+	Fingerprint  machoutil.BinaryFingerprint
+}
+
+// DoctorReport describes the independent compatibility checks completed by
+// the disposable runtime bridge.
+type DoctorReport struct {
+	Fingerprint               machoutil.BinaryFingerprint `json:"fingerprint"`
+	Profile                   string                      `json:"profile"`
+	KnownProfile              bool                        `json:"knownProfile"`
+	ProviderClass             string                      `json:"providerClass"`
+	BookClass                 string                      `json:"bookClass"`
+	ProviderInitializer       string                      `json:"providerInitializer"`
+	BookInitializer           string                      `json:"bookInitializer"`
+	ResourceBundleSetter      string                      `json:"resourceBundleSetter"`
+	ICUDataDirectorySetter    string                      `json:"icuDataDirectorySetter"`
+	DecryptSymbol             string                      `json:"decryptSymbol"`
+	CipherKeyLengthSymbol     string                      `json:"cipherKeyLengthSymbol"`
+	ContextKeyLengthAvailable bool                        `json:"contextKeyLengthAvailable"`
+	RegistrationValidated     bool                        `json:"registrationValidated"`
+	AccountSecretAvailable    bool                        `json:"accountSecretAvailable"`
+	HashedAccountSecret       bool                        `json:"hashedAccountSecret"`
+	AccountSecretProbeError   string                      `json:"accountSecretProbeError,omitempty"`
 }
 
 type captureState struct {
@@ -39,6 +68,16 @@ type captureState struct {
 // OpenBook loads a disposable Kindle runtime and opens one downloaded bundle.
 // All foreign calls originate from Go through a cgo-free dynamic-call bridge.
 func OpenBook(runtimePath, bundlePath, preferencesPath, resourcesPath string) (Capture, error) {
+	return OpenBookWithAccountSecret(runtimePath, bundlePath, preferencesPath, resourcesPath, "")
+}
+
+// OpenBookWithAccountSecret opens a book with an optional caller-supplied raw
+// device account secret. The value is used only in this short-lived process.
+func OpenBookWithAccountSecret(runtimePath, bundlePath, preferencesPath, resourcesPath, accountSecret string) (Capture, error) {
+	fingerprint, profile, knownProfile, err := runtimeProfile(runtimePath)
+	if err != nil {
+		return Capture{}, err
+	}
 	if _, err := purego.Dlopen(foundationPath, purego.RTLD_GLOBAL|purego.RTLD_NOW); err != nil {
 		return Capture{}, fmt.Errorf("load Foundation: %w", err)
 	}
@@ -57,26 +96,48 @@ func OpenBook(runtimePath, bundlePath, preferencesPath, resourcesPath string) (C
 	// objects that those threads still reference.
 	_ = pool
 
-	dsn, err := deviceSerial(preferencesPath)
+	credentials, err := readerconfig.LoadCredentials(preferencesPath)
 	if err != nil {
 		return Capture{}, err
+	}
+	if accountSecret != "" {
+		if len(accountSecret) != 40 {
+			return Capture{}, fmt.Errorf("supplied account-secret length is %d; expected 40", len(accountSecret))
+		}
+		credentials.AccountSecrets = []string{accountSecret}
+	}
+	requirements, err := readerconfig.InspectVouchers(bundlePath)
+	if err != nil {
+		return Capture{}, err
+	}
+	if requirements.AccountSecret && len(credentials.AccountSecrets) == 0 {
+		secret, secretErr := runtimeAccountSecret()
+		if secretErr == nil {
+			credentials.AccountSecrets = []string{secret}
+		} else {
+			detail := "reader preferences contain no usable raw account secret"
+			if credentials.HashedAccountSecret != "" {
+				detail += "; the stored hashed account secret is not a valid substitute"
+			}
+			return Capture{}, fmt.Errorf("book voucher requires ACCOUNT_SECRET: %s; runtime lookup failed: %w",
+				detail, secretErr)
+		}
 	}
 	mainPath, vouchers, containers, err := bundleObjects(bundlePath)
 	if err != nil {
 		return Capture{}, err
 	}
 
-	providerClass := objc.GetClass("KRFDRMDataProvider")
-	bookClass := objc.GetClass("KRFBook")
-	if providerClass == 0 || bookClass == 0 {
-		return Capture{}, errors.New("kindle reading classes are unavailable")
+	reader, err := resolveReaderInterface(profile.Reader)
+	if err != nil {
+		return Capture{}, runtimeCompatibilityError(runtimePath, err)
 	}
 	nsResources := nsString(filepath.Join(resourcesPath, "KRFResources"))
-	objc.ID(bookClass).Send(objc.RegisterName("setResourceBundlePath:"), nsResources)
-	objc.ID(bookClass).Send(objc.RegisterName("setICUDataDirectory:"), nsString(resourcesPath))
+	objc.ID(reader.bookClass).Send(reader.setResourceBundlePath, nsResources)
+	objc.ID(reader.bookClass).Send(reader.setICUDataDirectory, nsString(resourcesPath))
 	state := &captureState{active: true}
-	if err := installKeyCapture(handle, state); err != nil {
-		return Capture{}, err
+	if err := installKeyCapture(handle, runtimePath, state, profile.Crypto); err != nil {
+		return Capture{}, runtimeCompatibilityError(runtimePath, err)
 	}
 	defer func() {
 		state.mu.Lock()
@@ -85,23 +146,27 @@ func OpenBook(runtimePath, bundlePath, preferencesPath, resourcesPath string) (C
 		state.active = false
 	}()
 
-	emptyArray := objc.ID(objc.GetClass("NSArray")).Send(objc.RegisterName("array"))
-	provider := objc.ID(providerClass).Send(objc.RegisterName("alloc")).Send(
-		objc.RegisterName("initWithAccountSecrets:kindleSerialNumber:voucherList:"),
-		emptyArray, nsString(dsn), nsURLArray(vouchers))
+	provider := objc.ID(reader.providerClass).Send(objc.RegisterName("alloc")).Send(
+		reader.providerInitializer,
+		nsStringArray(credentials.AccountSecrets), nsString(credentials.DSN), nsURLArray(vouchers))
 	if provider == 0 {
 		return Capture{}, errors.New("kindle DRM provider initialization failed")
 	}
 	var nsError objc.ID
-	book := objc.ID(bookClass).Send(objc.RegisterName("alloc")).Send(
-		objc.RegisterName("initWithURL:DRMDataProvider:containers:error:"),
+	book := objc.ID(reader.bookClass).Send(objc.RegisterName("alloc")).Send(
+		reader.bookInitializer,
 		nsFileURL(mainPath), provider, nsURLArray(containers), unsafe.Pointer(&nsError))
 	if book == 0 {
 		code := int64(0)
+		domain := ""
+		description := ""
 		if nsError != 0 {
 			code = objc.Send[int64](nsError, objc.RegisterName("code"))
+			domain = nsGoString(objc.Send[objc.ID](nsError, objc.RegisterName("domain")))
+			description = nsGoString(objc.Send[objc.ID](nsError, objc.RegisterName("localizedDescription")))
 		}
-		return Capture{}, fmt.Errorf("kindle book open failed (code %d)", code)
+		return Capture{}, fmt.Errorf("reader book open failed (domain %q, code %d): %s",
+			domain, code, valueOrFallback(description, "no description"))
 	}
 
 	state.mu.Lock()
@@ -112,33 +177,149 @@ func OpenBook(runtimePath, bundlePath, preferencesPath, resourcesPath string) (C
 	if state.different {
 		return Capture{}, errors.New("kindle runtime used more than one distinct content key")
 	}
-	result := Capture{Key: append([]byte(nil), state.key...), Uses: state.uses}
+	result := Capture{
+		Key: append([]byte(nil), state.key...), Uses: state.uses,
+		Profile: profile.Name, KnownProfile: knownProfile, Fingerprint: fingerprint,
+	}
 	return result, nil
 }
 
-func deviceSerial(path string) (string, error) {
-	data, err := os.ReadFile(path)
+// Doctor loads the disposable runtime without opening a book or installing a
+// hook. It verifies the build profile, Objective-C interface, dynamic symbol
+// ownership, and relocatability of the prospective hook prologue.
+func Doctor(runtimePath, preferencesPath string) (DoctorReport, error) {
+	fingerprint, profile, knownProfile, err := runtimeProfile(runtimePath)
 	if err != nil {
-		return "", fmt.Errorf("read Kindle preferences: %w", err)
+		return DoctorReport{}, err
 	}
-	var preferences map[string]any
-	if _, err := plist.Unmarshal(data, &preferences); err != nil {
-		return "", fmt.Errorf("decode Kindle preferences: %w", err)
+	if _, err := purego.Dlopen(foundationPath, purego.RTLD_GLOBAL|purego.RTLD_NOW); err != nil {
+		return DoctorReport{}, fmt.Errorf("load Foundation: %w", err)
 	}
-	raw, ok := preferences["kindle_notifications_persist_NotificationsCustomData"].(string)
-	if !ok || raw == "" {
-		return "", errors.New("kindle device registration is unavailable")
+	handle, err := purego.Dlopen(runtimePath, purego.RTLD_LOCAL|purego.RTLD_NOW)
+	if err != nil {
+		return DoctorReport{}, fmt.Errorf("load disposable reader runtime: %w", err)
 	}
-	var payload struct {
-		DSN string `json:"dsn"`
+	reader, err := resolveReaderInterface(profile.Reader)
+	if err != nil {
+		return DoctorReport{}, runtimeCompatibilityError(runtimePath, err)
 	}
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-		return "", fmt.Errorf("decode Kindle device registration: %w", err)
+	crypto, err := resolveCryptoSymbols(handle, runtimePath, profile.Crypto)
+	if err != nil {
+		return DoctorReport{}, runtimeCompatibilityError(runtimePath, err)
 	}
-	if payload.DSN == "" {
-		return "", errors.New("kindle device serial is empty")
+	registrationValidated := false
+	accountSecretAvailable := false
+	hashedAccountSecret := false
+	accountSecretProbeError := ""
+	if preferencesPath != "" {
+		credentials, err := readerconfig.LoadCredentials(preferencesPath)
+		if err != nil {
+			return DoctorReport{}, fmt.Errorf("validate reader registration: %w", err)
+		}
+		registrationValidated = true
+		accountSecretAvailable = len(credentials.AccountSecrets) != 0
+		hashedAccountSecret = credentials.HashedAccountSecret != ""
+		if !accountSecretAvailable {
+			if _, secretErr := runtimeAccountSecret(); secretErr != nil {
+				accountSecretProbeError = secretErr.Error()
+			} else {
+				accountSecretAvailable = true
+			}
+		}
 	}
-	return payload.DSN, nil
+	return DoctorReport{
+		Fingerprint: fingerprint, Profile: profile.Name, KnownProfile: knownProfile,
+		ProviderClass: reader.providerClassName, BookClass: reader.bookClassName,
+		ProviderInitializer:       reader.providerInitializerName,
+		BookInitializer:           reader.bookInitializerName,
+		ResourceBundleSetter:      reader.resourceBundleName,
+		ICUDataDirectorySetter:    reader.icuDataDirectoryName,
+		DecryptSymbol:             profile.Crypto.DecryptInit,
+		CipherKeyLengthSymbol:     profile.Crypto.CipherKeyLength,
+		ContextKeyLengthAvailable: crypto.contextKeyLength != 0,
+		RegistrationValidated:     registrationValidated,
+		AccountSecretAvailable:    accountSecretAvailable,
+		HashedAccountSecret:       hashedAccountSecret,
+		AccountSecretProbeError:   accountSecretProbeError,
+	}, nil
+}
+
+// runtimeAccountSecret asks the reader's already-loaded authentication
+// manager for its in-memory credential. It never logs or persists the value.
+// Class and selector names are preferred anchors only; interface matching is
+// used as a fail-closed fallback when a future build renames them.
+func runtimeAccountSecret() (string, error) {
+	runtime, err := loadObjectiveCRuntime()
+	if err != nil {
+		return "", err
+	}
+	getter := objectiveCMethodRequirement{
+		role: "account-secret getter", preferredNames: []string{"accountSecret"},
+		prefix: "account", argumentCount: 2, semanticTerms: [][]string{{"secret"}},
+	}
+	shared := objectiveCMethodRequirement{
+		role: "authentication-manager singleton", preferredNames: []string{"sharedInstance"},
+		prefix: "shared", argumentCount: 2, semanticTerms: [][]string{{"shared"}}, classMethod: true,
+	}
+	cache := objectiveCMethodRequirement{
+		role: "authentication cache loader", preferredNames: []string{"cacheInformation"},
+		prefix: "cache", argumentCount: 2, semanticTerms: [][]string{{"information"}},
+	}
+	class, err := resolveObjectiveCClass(runtime, objectiveCClassRequirement{
+		role: "authentication manager", preferredNames: []string{"AuthenticationManager"},
+		directInstanceMethod: getter, instanceMethods: []objectiveCMethodRequirement{getter, cache},
+		classMethods: []objectiveCMethodRequirement{shared},
+	})
+	if err != nil {
+		return "", err
+	}
+	sharedSelector, err := resolveObjectiveCMethod(runtime, class, shared)
+	if err != nil {
+		return "", err
+	}
+	getterSelector, err := resolveObjectiveCMethod(runtime, class, getter)
+	if err != nil {
+		return "", err
+	}
+	cacheSelector, err := resolveObjectiveCMethod(runtime, class, cache)
+	if err != nil {
+		return "", err
+	}
+	manager := objc.ID(class).Send(sharedSelector)
+	if manager == 0 {
+		return "", errors.New("reader authentication manager is unavailable")
+	}
+	manager.Send(cacheSelector)
+	secret := strings.TrimSpace(nsGoString(manager.Send(getterSelector)))
+	if len(secret) != 40 {
+		return "", fmt.Errorf("reader authentication manager returned account-secret length %d; expected 40", len(secret))
+	}
+	return secret, nil
+}
+
+func runtimeProfile(runtimePath string) (machoutil.BinaryFingerprint, compatibility.Profile, bool, error) {
+	data, err := os.ReadFile(runtimePath)
+	if err != nil {
+		return machoutil.BinaryFingerprint{}, compatibility.Profile{}, false, fmt.Errorf("read reader runtime: %w", err)
+	}
+	fingerprint, err := machoutil.FingerprintARM64(data)
+	if err != nil {
+		return machoutil.BinaryFingerprint{}, compatibility.Profile{}, false, err
+	}
+	profile, known := compatibility.Resolve(fingerprint.UUID, fingerprint.TextSHA256)
+	return fingerprint, profile, known, nil
+}
+
+func runtimeCompatibilityError(runtimePath string, compatibilityErr error) error {
+	data, err := os.ReadFile(runtimePath)
+	if err != nil {
+		return compatibilityErr
+	}
+	fingerprint, err := machoutil.FingerprintARM64(data)
+	if err != nil {
+		return compatibilityErr
+	}
+	return fmt.Errorf("%w (%s)", compatibilityErr, fingerprint)
 }
 
 func bundleObjects(root string) (mainPath string, vouchers, containers []string, err error) {
@@ -175,6 +356,21 @@ func nsString(value string) objc.ID {
 		objc.RegisterName("stringWithUTF8String:"), value+"\x00")
 }
 
+func nsGoString(value objc.ID) string {
+	if value == 0 {
+		return ""
+	}
+	address := objc.Send[uintptr](value, objc.RegisterName("UTF8String"))
+	return cStringAt(address, 4096)
+}
+
+func valueOrFallback(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
 func nsFileURL(path string) objc.ID {
 	return objc.ID(objc.GetClass("NSURL")).Send(
 		objc.RegisterName("fileURLWithPath:"), nsString(path))
@@ -189,21 +385,25 @@ func nsURLArray(paths []string) objc.ID {
 	return array
 }
 
-func installKeyCapture(handle uintptr, state *captureState) error {
-	initAddress, err := purego.Dlsym(handle, "EVP_DecryptInit_ex")
-	if err != nil {
-		return fmt.Errorf("find Kindle decrypt entry point: %w", err)
+func nsStringArray(values []string) objc.ID {
+	array := objc.ID(objc.GetClass("NSMutableArray")).Send(objc.RegisterName("array"))
+	add := objc.RegisterName("addObject:")
+	for _, value := range values {
+		array.Send(add, nsString(value))
 	}
-	keyLengthAddress, err := purego.Dlsym(handle, "EVP_CIPHER_key_length")
+	return array
+}
+
+func installKeyCapture(handle uintptr, runtimePath string, state *captureState, anchors compatibility.CryptoAnchors) error {
+	crypto, err := resolveCryptoSymbols(handle, runtimePath, anchors)
 	if err != nil {
-		return fmt.Errorf("find Kindle cipher key-length function: %w", err)
+		return err
 	}
-	contextLengthAddress, _ := purego.Dlsym(handle, "EVP_CIPHER_CTX_key_length")
 	var cipherKeyLength func(unsafe.Pointer) int32
-	purego.RegisterFunc(&cipherKeyLength, keyLengthAddress)
+	purego.RegisterFunc(&cipherKeyLength, crypto.cipherKeyLength)
 	var contextKeyLength func(unsafe.Pointer) int32
-	if contextLengthAddress != 0 {
-		purego.RegisterFunc(&contextKeyLength, contextLengthAddress)
+	if crypto.contextKeyLength != 0 {
+		purego.RegisterFunc(&contextKeyLength, crypto.contextKeyLength)
 	}
 	var original func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	callback := purego.NewCallback(func(context, cipherType, implementation, key, iv unsafe.Pointer) uintptr {
@@ -236,7 +436,7 @@ func installKeyCapture(handle uintptr, state *captureState) error {
 		state.mu.Unlock()
 		return uintptr(uint32(result))
 	})
-	trampoline, mapped, err := installInlineHook(initAddress, callback)
+	trampoline, mapped, err := installInlineHook(crypto.decryptInit, callback)
 	if err != nil {
 		return err
 	}
@@ -245,12 +445,117 @@ func installKeyCapture(handle uintptr, state *captureState) error {
 	return nil
 }
 
+type cryptoSymbols struct {
+	decryptInit      uintptr
+	cipherKeyLength  uintptr
+	contextKeyLength uintptr
+}
+
+type dynamicSymbolInfo struct {
+	imagePath     uintptr
+	imageBase     uintptr
+	symbolName    uintptr
+	symbolAddress uintptr
+}
+
+func resolveCryptoSymbols(handle uintptr, runtimePath string, anchors compatibility.CryptoAnchors) (cryptoSymbols, error) {
+	decryptInit, err := requiredDynamicSymbol(handle, runtimePath, anchors.DecryptInit)
+	if err != nil {
+		return cryptoSymbols{}, fmt.Errorf("find reader decrypt entry point: %w", err)
+	}
+	code := make([]byte, inlineHookSize)
+	if err := copyFromAddress(code, decryptInit); err != nil {
+		return cryptoSymbols{}, err
+	}
+	if err := validateRelocatablePrologue(code); err != nil {
+		return cryptoSymbols{}, fmt.Errorf("unsupported crypto entry point: %w", err)
+	}
+	cipherKeyLength, err := requiredDynamicSymbol(handle, runtimePath, anchors.CipherKeyLength)
+	if err != nil {
+		return cryptoSymbols{}, fmt.Errorf("find reader cipher key-length function: %w", err)
+	}
+	contextKeyLength := uintptr(0)
+	if anchors.ContextKeyLength != "" {
+		if address, lookupErr := purego.Dlsym(handle, anchors.ContextKeyLength); lookupErr == nil && address != 0 {
+			if err := validateDynamicSymbol(address, runtimePath, anchors.ContextKeyLength); err != nil {
+				return cryptoSymbols{}, err
+			}
+			contextKeyLength = address
+		}
+	}
+	return cryptoSymbols{
+		decryptInit: decryptInit, cipherKeyLength: cipherKeyLength,
+		contextKeyLength: contextKeyLength,
+	}, nil
+}
+
+func requiredDynamicSymbol(handle uintptr, runtimePath, name string) (uintptr, error) {
+	if name == "" {
+		return 0, errors.New("compatibility profile contains an empty symbol name")
+	}
+	address, err := purego.Dlsym(handle, name)
+	if err != nil {
+		return 0, err
+	}
+	if err := validateDynamicSymbol(address, runtimePath, name); err != nil {
+		return 0, err
+	}
+	return address, nil
+}
+
+func validateDynamicSymbol(address uintptr, runtimePath, expectedName string) error {
+	if address == 0 || address%4 != 0 {
+		return fmt.Errorf("symbol %s has invalid arm64 address %#x", expectedName, address)
+	}
+	var dladdr func(uintptr, *dynamicSymbolInfo) int32
+	purego.RegisterLibFunc(&dladdr, purego.RTLD_DEFAULT, "dladdr")
+	var info dynamicSymbolInfo
+	if result := dladdr(address, &info); result == 0 {
+		return fmt.Errorf("dladdr could not resolve %s", expectedName)
+	}
+	if info.imageBase == 0 || info.symbolAddress != address || address < info.imageBase {
+		return fmt.Errorf("symbol %s does not resolve to its own loaded-image entry point", expectedName)
+	}
+	actualName := strings.TrimPrefix(cStringAt(info.symbolName, 512), "_")
+	if actualName != expectedName {
+		return fmt.Errorf("symbol identity mismatch: requested %s, resolved %q", expectedName, actualName)
+	}
+	loadedPath := cStringAt(info.imagePath, 4096)
+	loadedInfo, loadedErr := os.Stat(loadedPath)
+	runtimeInfo, runtimeErr := os.Stat(runtimePath)
+	if loadedErr != nil || runtimeErr != nil || !os.SameFile(loadedInfo, runtimeInfo) {
+		return fmt.Errorf("symbol %s belongs to unexpected image %q", expectedName, loadedPath)
+	}
+	return nil
+}
+
+func cStringAt(address uintptr, limit int) string {
+	if address == 0 || limit <= 0 {
+		return ""
+	}
+	var stringLength func(uintptr, uintptr) uintptr
+	purego.RegisterLibFunc(&stringLength, purego.RTLD_DEFAULT, "strnlen")
+	length := stringLength(address, uintptr(limit))
+	if length == 0 || length >= uintptr(limit) {
+		return ""
+	}
+	data := make([]byte, length)
+	if err := copyFromAddress(data, address); err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 func installInlineHook(target, replacement uintptr) (uintptr, []byte, error) {
-	expected := []byte{0xff, 0x03, 0x01, 0xd1, 0xfd, 0x7b, 0x03, 0xa9, 0xfd, 0xc3, 0x00, 0x91}
-	actual := make([]byte, len(expected))
-	if target == 0 || replacement == 0 || copyFromAddress(actual, target) != nil ||
-		!bytes.Equal(actual, expected) {
-		return 0, nil, errors.New("this Kindle build has an unsupported crypto entry point")
+	if target == 0 || replacement == 0 {
+		return 0, nil, errors.New("crypto hook address is nil")
+	}
+	originalCode := make([]byte, inlineHookSize)
+	if err := copyFromAddress(originalCode, target); err != nil {
+		return 0, nil, err
+	}
+	if err := validateRelocatablePrologue(originalCode); err != nil {
+		return 0, nil, fmt.Errorf("unsupported crypto entry point: %w", err)
 	}
 	pageSize := syscall.Getpagesize()
 	trampoline, err := syscall.Mmap(-1, 0, pageSize,
@@ -259,32 +564,69 @@ func installInlineHook(target, replacement uintptr) (uintptr, []byte, error) {
 		return 0, nil, fmt.Errorf("allocate hook trampoline: %w", err)
 	}
 	trampolineAddress := uintptr(unsafe.Pointer(&trampoline[0]))
-	if err := copyFromAddress(trampoline[:16], target); err != nil {
-		_ = syscall.Munmap(trampoline)
-		return 0, nil, err
-	}
-	writeAbsoluteJump(trampoline[16:32], target+16)
+	copy(trampoline[:inlineHookSize], originalCode)
+	writeAbsoluteJump(trampoline[inlineHookSize:inlineHookSize*2], target+inlineHookSize)
 	if err := syscall.Mprotect(trampoline, syscall.PROT_READ|syscall.PROT_EXEC); err != nil {
 		_ = syscall.Munmap(trampoline)
 		return 0, nil, fmt.Errorf("make hook trampoline executable: %w", err)
 	}
-	invalidateInstructionCache(trampolineAddress, 32)
+	invalidateInstructionCache(trampolineAddress, inlineHookSize*2)
 
 	page := target & ^(uintptr(pageSize) - 1)
-	if err := protectMachPage(page, uintptr(pageSize), 1|2|0x10); err != nil {
+	protectionSize := uintptr(pageSize)
+	if target+inlineHookSize > page+uintptr(pageSize) {
+		protectionSize += uintptr(pageSize)
+	}
+	if err := protectMachPage(page, protectionSize, 1|2|0x10); err != nil {
 		_ = syscall.Munmap(trampoline)
 		return 0, nil, fmt.Errorf("make Kindle decrypt entry point writable: %w", err)
 	}
-	jump := make([]byte, 16)
+	jump := make([]byte, inlineHookSize)
 	writeAbsoluteJump(jump, replacement)
 	if err := copyToAddress(target, jump); err != nil {
-		return 0, nil, err
+		restoreErr := protectMachPage(page, protectionSize, 1|4)
+		_ = syscall.Munmap(trampoline)
+		return 0, nil, errors.Join(err, restoreErr)
 	}
-	invalidateInstructionCache(target, 16)
-	if err := protectMachPage(page, uintptr(pageSize), 1|4); err != nil {
+	invalidateInstructionCache(target, inlineHookSize)
+	if err := protectMachPage(page, protectionSize, 1|4); err != nil {
+		_ = syscall.Munmap(trampoline)
 		return 0, nil, fmt.Errorf("restore Kindle code protection: %w", err)
 	}
 	return trampolineAddress, trampoline, nil
+}
+
+func validateRelocatablePrologue(code []byte) error {
+	if len(code) != inlineHookSize {
+		return fmt.Errorf("prologue is %d bytes; need %d", len(code), inlineHookSize)
+	}
+	for offset := 0; offset < len(code); offset += 4 {
+		instruction, err := arm64asm.Decode(code[offset : offset+4])
+		if err != nil {
+			return fmt.Errorf("decode instruction at +%#x: %w", offset, err)
+		}
+		for _, argument := range instruction.Args {
+			if _, ok := argument.(arm64asm.PCRel); ok {
+				return fmt.Errorf("PC-relative instruction at +%#x: %s", offset, instruction)
+			}
+		}
+		if changesControlFlow(instruction.Op.String()) {
+			return fmt.Errorf("control-flow instruction at +%#x: %s", offset, instruction)
+		}
+	}
+	return nil
+}
+
+func changesControlFlow(operation string) bool {
+	switch operation {
+	case "BR", "BRAA", "BRAAZ", "BRAB", "BRABZ",
+		"BLR", "BLRAA", "BLRAAZ", "BLRAB", "BLRABZ",
+		"RET", "RETAA", "RETAB", "ERET", "ERETAA", "ERETAB", "DRPS",
+		"SVC", "HVC", "SMC", "BRK", "HLT", "DCPS1", "DCPS2", "DCPS3":
+		return true
+	default:
+		return false
+	}
 }
 
 func writeAbsoluteJump(destination []byte, address uintptr) {

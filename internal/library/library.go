@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -35,7 +34,8 @@ type Root struct {
 	MetadataDB  string
 }
 
-// Output pairs a selected book with its final archive path.
+// Output pairs a selected book with its collision-free destination base path.
+// The conversion layer adds the selected final-format extension.
 type Output struct {
 	Book Book
 	Path string
@@ -153,7 +153,7 @@ func Filter(books []Book, pattern string) ([]Book, error) {
 	return matched, nil
 }
 
-// PlanOutputs creates collision-free archive paths under target.
+// PlanOutputs creates collision-free destination base paths under target.
 func PlanOutputs(books []Book, target string) []Output {
 	bases := make([]string, len(books))
 	counts := make(map[string]int)
@@ -167,7 +167,7 @@ func PlanOutputs(books []Book, target string) []Output {
 		if counts[strings.ToLower(base)] > 1 {
 			base += " [" + SafeName(book.ID) + "]"
 		}
-		outputs = append(outputs, Output{Book: book, Path: filepath.Join(target, base+".kfx-zip")})
+		outputs = append(outputs, Output{Book: book, Path: filepath.Join(target, base)})
 	}
 	return outputs
 }
@@ -232,58 +232,6 @@ func SafeFilename(value string) string {
 		name = strings.TrimRight(name, " .-")
 	}
 	return name
-}
-
-// RenamePDFs replaces leading book IDs in PDF filenames with display titles.
-func RenamePDFs(directory string, books []Book, output io.Writer) (int, error) {
-	absolute, err := filepath.Abs(directory)
-	if err != nil {
-		return 0, err
-	}
-	entries, err := os.ReadDir(absolute)
-	if err != nil {
-		return 0, fmt.Errorf("read PDF directory: %w", err)
-	}
-	titles := make(map[string]string)
-	for _, book := range books {
-		if book.Title != "" {
-			titles[strings.ToUpper(book.ID)] = SafeFilename(book.Title)
-		}
-	}
-	renamed := 0
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".pdf") {
-			continue
-		}
-		extension := filepath.Ext(entry.Name())
-		stem := strings.TrimSuffix(entry.Name(), extension)
-		for id, title := range titles {
-			if len(stem) < len(id) || !strings.EqualFold(stem[:len(id)], id) {
-				continue
-			}
-			suffix := stem[len(id):]
-			if suffix != "" && !strings.ContainsRune("._- ", rune(suffix[0])) {
-				continue
-			}
-			source := filepath.Join(absolute, entry.Name())
-			destination := filepath.Join(absolute, title+suffix+extension)
-			if source == destination {
-				break
-			}
-			if _, statErr := os.Stat(destination); statErr == nil {
-				return renamed, fmt.Errorf("refuse to overwrite renamed PDF: %s", destination)
-			} else if !errors.Is(statErr, os.ErrNotExist) {
-				return renamed, statErr
-			}
-			if err := os.Rename(source, destination); err != nil {
-				return renamed, fmt.Errorf("rename PDF %s: %w", source, err)
-			}
-			fmt.Fprintf(output, "Renamed: %s -> %s\n", entry.Name(), filepath.Base(destination))
-			renamed++
-			break
-		}
-	}
-	return renamed, nil
 }
 
 func isReaderLibraryPath(home, path string) bool {

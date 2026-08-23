@@ -2,32 +2,48 @@
 package debugcmd
 
 import (
+	"bytes"
+	"context"
 	"debug/macho"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/spf13/pflag"
 	"golang.org/x/arch/arm64/arm64asm"
 
+	"leafport/internal/compatibility"
+	"leafport/internal/kfxconvert"
 	"leafport/internal/machoutil"
 )
 
 // Run executes one debug subcommand.
-func Run(arguments []string, stdout, stderr io.Writer) error {
+func Run(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {
 	if len(arguments) == 0 || arguments[0] == "help" || arguments[0] == "--help" {
 		printDebugUsage(stdout)
 		return nil
 	}
 	switch arguments[0] {
+	case "analyze":
+		return runDebugAnalyze(arguments[1:], stdout, stderr)
 	case "disasm":
 		return runDebugDisasm(arguments[1:], stdout, stderr)
 	case "dylibify":
 		return runDebugDylibify(arguments[1:], stderr)
+	case "capture":
+		return runDebugCapture(ctx, arguments[1:], stdout, stderr)
+	case "kfx":
+		return runDebugKFX(arguments[1:], stdout, stderr)
+	case "pdf":
+		return runDebugPDF(arguments[1:], stdout, stderr)
+	case "objc":
+		return runDebugObjC(arguments[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown debug subcommand %q (use: debug --help)", arguments[0])
 	}
@@ -35,12 +51,299 @@ func Run(arguments []string, stdout, stderr io.Writer) error {
 
 func printDebugUsage(writer io.Writer) {
 	fmt.Fprintln(writer, `Usage:
+  leafport debug analyze [--binary PATH]
   leafport debug disasm [flags]
   leafport debug dylibify --in SOURCE --out DESTINATION
+  leafport debug capture --id BOOK_ID --out ARCHIVE
+  leafport debug kfx --in ARCHIVE
+  leafport debug pdf --in FILE
+  leafport debug objc [--binary PATH] [--class REGEX]
 
 Debug subcommands:
+  analyze   fingerprint a build and report compatibility anchors
   disasm    inspect a small arm64 Mach-O address range or find references
-  dylibify  make a disposable MH_DYLIB copy of a thin 64-bit Mach-O`)
+  dylibify  make a disposable MH_DYLIB copy of a thin 64-bit Mach-O
+  capture   retain one decrypted KFX archive for maintenance analysis
+  kfx       validate and classify a decrypted KFX archive
+  pdf       validate PDF pages, outlines, and link annotations
+  objc      list per-class Objective-C methods and implementation addresses`)
+}
+
+func runDebugKFX(arguments []string, stdout, stderr io.Writer) error {
+	flags := pflag.NewFlagSet("debug kfx", pflag.ContinueOnError)
+	flags.SetOutput(stderr)
+	input := flags.String("in", "", "decrypted .kfx-zip archive")
+	typeList := flags.String("types", "", "comma-separated entity type IDs to dump")
+	limit := flags.Int("limit", 20, "maximum dumped entities")
+	showPlan := flags.Bool("plan", false, "derive fixed-layout resource order")
+	dependency := flags.Uint64("dependency", 0, "dump dependencies for one numeric fragment ID")
+	node := flags.Uint64("node", 0, "dump content nodes with one numeric location ID")
+	pdfOut := flags.String("pdf-out", "", "write reconstructed fixed-layout PDF")
+	epubOut := flags.String("epub-out", "", "write reconstructed reflowable EPUB")
+	cbzOut := flags.String("cbz-out", "", "write image-backed fixed-layout pages as CBZ")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "Usage: leafport debug kfx --in ARCHIVE")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(arguments); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 || *input == "" {
+		return errors.New("debug kfx requires --in ARCHIVE")
+	}
+	inspection, err := kfxconvert.InspectArchive(*input)
+	if err != nil {
+		return fmt.Errorf("debug kfx: %w", err)
+	}
+	fmt.Fprintf(stdout, "Containers: %d\nEntities: %d\nRaw media: %d\nPDF resources: %d\nImage resources: %d\nFont resources: %d\n",
+		inspection.Containers, inspection.Entities, inspection.RawMedia,
+		inspection.PDFResources, inspection.ImageResources, inspection.FontResources)
+	decision, err := kfxconvert.PreferredFormat(*input)
+	if err != nil {
+		return fmt.Errorf("debug kfx: choose output format: %w", err)
+	}
+	fmt.Fprintf(stdout, "Preferred final format: %s (%s)\n", decision.Format, decision.Reason)
+	if *showPlan {
+		pages, planErr := kfxconvert.FixedLayoutPages(*input)
+		if planErr != nil {
+			return fmt.Errorf("debug kfx: derive page plan: %w", planErr)
+		}
+		pdfPages := 0
+		locations := make(map[string]bool)
+		for _, page := range pages {
+			if page.Format == 565 {
+				pdfPages++
+			}
+			locations[page.Location] = true
+		}
+		fmt.Fprintf(stdout, "Ordered page resources: %d (%d PDF, %d raster across %d raw resources)\n",
+			len(pages), pdfPages, len(pages)-pdfPages, len(locations))
+	}
+	if *typeList != "" {
+		var types []uint32
+		for _, item := range strings.Split(*typeList, ",") {
+			value, parseErr := strconv.ParseUint(strings.TrimSpace(item), 10, 32)
+			if parseErr != nil {
+				return fmt.Errorf("debug kfx: invalid entity type %q", item)
+			}
+			types = append(types, uint32(value))
+		}
+		if err := kfxconvert.DumpEntities(*input, types, *limit, stdout); err != nil {
+			return fmt.Errorf("debug kfx: %w", err)
+		}
+	}
+	if *dependency != 0 {
+		if err := kfxconvert.DumpDependency(*input, *dependency, stdout); err != nil {
+			return fmt.Errorf("debug kfx: %w", err)
+		}
+	}
+	if *node != 0 {
+		if *node > uint64(^uint32(0)) {
+			return fmt.Errorf("debug kfx: node ID %d exceeds uint32", *node)
+		}
+		if err := kfxconvert.DumpNode(*input, uint32(*node), stdout); err != nil {
+			return fmt.Errorf("debug kfx: %w", err)
+		}
+	}
+	if *pdfOut != "" {
+		result, err := kfxconvert.ConvertToPDF(*input, *pdfOut)
+		if err != nil {
+			return fmt.Errorf("debug kfx: %w", err)
+		}
+		fmt.Fprintf(stdout, "PDF: %s (%d pages from %d resource groups; exact copy: %t)\n",
+			*pdfOut, result.Pages, result.Resources, result.ExactCopy)
+	}
+	if *epubOut != "" {
+		result, err := kfxconvert.ConvertToEPUB(*input, *epubOut, kfxconvert.Metadata{})
+		if err != nil {
+			return fmt.Errorf("debug kfx: %w", err)
+		}
+		fmt.Fprintf(stdout, "EPUB: %s (%d sections, %d images, %d media, %d fonts)\n",
+			*epubOut, result.Sections, result.Images, result.Media, result.Fonts)
+	}
+	if *cbzOut != "" {
+		result, err := kfxconvert.ConvertToCBZ(*input, *cbzOut)
+		if err != nil {
+			return fmt.Errorf("debug kfx: %w", err)
+		}
+		fmt.Fprintf(stdout, "CBZ: %s (%d pages from %d resource groups)\n",
+			*cbzOut, result.Pages, result.Resources)
+	}
+	return nil
+}
+
+func runDebugAnalyze(arguments []string, stdout, stderr io.Writer) error {
+	flags := pflag.NewFlagSet("debug analyze", pflag.ContinueOnError)
+	flags.SetOutput(stderr)
+	binaryPath := flags.String("binary", "/Applications/Amazon Kindle.app/Contents/MacOS/Kindle", "Mach-O path")
+	showCandidates := flags.Bool("candidates", false, "list related Objective-C metadata for re-analysis")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "Usage: leafport debug analyze [--binary PATH]")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(arguments); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("debug analyze: unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	data, err := os.ReadFile(*binaryPath)
+	if err != nil {
+		return fmt.Errorf("debug analyze: %w", err)
+	}
+	fingerprint, err := machoutil.FingerprintARM64(data)
+	if err != nil {
+		return fmt.Errorf("debug analyze: %w", err)
+	}
+	file, closeFile, err := openArm64(*binaryPath)
+	if err != nil {
+		return fmt.Errorf("debug analyze: %w", err)
+	}
+	defer closeFile()
+
+	fmt.Fprintf(stdout, "Binary: %s\n", *binaryPath)
+	if fingerprint.UUID == "" {
+		fmt.Fprintln(stdout, "UUID: unavailable")
+	} else {
+		fmt.Fprintf(stdout, "UUID: %s\n", fingerprint.UUID)
+	}
+	fmt.Fprintf(stdout, "__text SHA-256: %s\n", fingerprint.TextSHA256)
+	profile, exact := compatibility.Resolve(fingerprint.UUID, fingerprint.TextSHA256)
+	if exact {
+		fmt.Fprintf(stdout, "Compatibility profile: %s (%s)\n", profile.Name, profile.AppVersion)
+	} else {
+		fmt.Fprintf(stdout, "Compatibility profile: %s (runtime validation required)\n", profile.Name)
+	}
+	printSymbolStatus(stdout, file, []string{
+		"EVP_DecryptInit_ex", "EVP_CIPHER_key_length", "EVP_CIPHER_CTX_key_length",
+	})
+	classes := objectiveCMetadata(file, "__objc_classname")
+	methods := objectiveCMetadata(file, "__objc_methname")
+	printMetadataStatus(stdout, "Objective-C classes", classes,
+		[]string{"KRFDRMDataProvider", "KRFBook"})
+	printMetadataStatus(stdout, "Credential classes", classes,
+		[]string{
+			"AuthenticationManager", "Keychain", "SecItemKeychainImpl",
+			"FileKeychainImpl", "KeychainUpgradeMigration", "SetAccountSecretTodoCommand",
+		})
+	printMetadataStatus(stdout, "Objective-C selectors", methods, []string{
+		"initWithURL:DRMDataProvider:containers:error:",
+		"setResourceBundlePath:", "setICUDataDirectory:",
+	})
+	printMetadataStatus(stdout, "Credential selectors", methods, []string{
+		"sharedInstance", "cacheInformation", "accountSecret", "setAccountSecret:",
+		"valueForKey:", "setValueOnBackgroundQueue:forKey:",
+		"parseAccountSecrets", "migrateAndCleanKeychain",
+		"initWithAccountSecrets:kindleSerialNumber:voucherList:",
+		"initWithpids:accountSecrets:deviceNumber:voucherPaths:containerPath:",
+	})
+	printByteAnchorStatus(stdout, data, "Credential storage anchors", []string{
+		"kindle.accountsecret.item", "com.amazon.Lassen.KeychainUI",
+		"HashedAccountSecret", "userDataDict.dat", "ckcidenabled",
+	})
+	if *showCandidates {
+		printCandidates(stdout, "Class candidates", classes,
+			[]string{"account", "auth", "drm", "keychain", "krf", "secret", "voucher"})
+		printCandidates(stdout, "Selector candidates", methods,
+			[]string{"account", "auth", "drm", "icudata", "keychain", "kindleserial", "resourcebundle", "secret", "voucher"})
+	}
+	return nil
+}
+
+func printByteAnchorStatus(writer io.Writer, data []byte, label string, names []string) {
+	fmt.Fprintf(writer, "%s:\n", label)
+	for _, name := range names {
+		fmt.Fprintf(writer, "  %s = %s\n", name, presence(bytes.Contains(data, []byte(name))))
+	}
+}
+
+func printSymbolStatus(writer io.Writer, file *macho.File, names []string) {
+	fmt.Fprintln(writer, "Crypto symbols:")
+	available := make(map[string]bool)
+	if file.Symtab != nil {
+		for _, symbol := range file.Symtab.Syms {
+			available[strings.TrimPrefix(symbol.Name, "_")] = true
+		}
+	}
+	for _, name := range names {
+		fmt.Fprintf(writer, "  %s = %s\n", name, presence(available[name]))
+	}
+}
+
+func objectiveCMetadata(file *macho.File, sectionName string) []string {
+	seen := make(map[string]bool)
+	for _, section := range file.Sections {
+		if section.Name != sectionName {
+			continue
+		}
+		data, err := section.Data()
+		if err != nil {
+			continue
+		}
+		for _, raw := range bytes.Split(data, []byte{0}) {
+			value := string(raw)
+			if value != "" && len(value) <= 512 && utf8.ValidString(value) {
+				seen[value] = true
+			}
+		}
+	}
+	values := make([]string, 0, len(seen))
+	for value := range seen {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func printMetadataStatus(writer io.Writer, label string, values, required []string) {
+	available := make(map[string]bool, len(values))
+	for _, value := range values {
+		available[value] = true
+	}
+	fmt.Fprintf(writer, "%s:\n", label)
+	for _, name := range required {
+		fmt.Fprintf(writer, "  %s = %s\n", name, presence(available[name]))
+	}
+}
+
+func printCandidates(writer io.Writer, label string, values, keywords []string) {
+	var matches []string
+	for _, value := range values {
+		lower := strings.ToLower(value)
+		for _, keyword := range keywords {
+			if strings.Contains(lower, keyword) {
+				matches = append(matches, value)
+				break
+			}
+		}
+	}
+	const limit = 40
+	fmt.Fprintf(writer, "%s:", label)
+	if len(matches) == 0 {
+		fmt.Fprintln(writer, " none")
+		return
+	}
+	fmt.Fprintln(writer)
+	for index, match := range matches {
+		if index == limit {
+			fmt.Fprintf(writer, "  ... and %d more\n", len(matches)-limit)
+			break
+		}
+		fmt.Fprintf(writer, "  %s\n", match)
+	}
+}
+
+func presence(present bool) string {
+	if present {
+		return "present"
+	}
+	return "missing"
 }
 
 func runDebugDylibify(arguments []string, stderr io.Writer) error {

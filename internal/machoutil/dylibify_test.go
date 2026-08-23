@@ -91,6 +91,51 @@ func TestPatchAndSignCurrentGoExecutable(t *testing.T) {
 	}
 }
 
+func TestPatchAndSignCurrentGoExecutableWithEntitlements(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = ThinARM64(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entitlements := []byte(`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>get-task-allow</key><false/></dict></plist>`)
+	data, err = AdHocSignWithEntitlements(data, "GoBridgeEntitlementsTest", entitlements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := EmbeddedEntitlements(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(entitlements) {
+		t.Fatalf("entitlements = %q, want %q", got, entitlements)
+	}
+}
+
+func TestFingerprintCurrentGoExecutable(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := FingerprintARM64(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fingerprint.TextSHA256) != 64 {
+		t.Fatalf("text hash = %q", fingerprint.TextSHA256)
+	}
+}
+
 func codeSignatureRange(t *testing.T, data []byte) (uint32, uint32) {
 	t.Helper()
 	ncmds := binary.LittleEndian.Uint32(data[16:20])

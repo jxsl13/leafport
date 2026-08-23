@@ -2,7 +2,6 @@ package library
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,32 +108,9 @@ func TestPlanExportsDisambiguatesDuplicateTitles(t *testing.T) {
 		t.Fatalf("duplicate output paths: %q", jobs[0].Path)
 	}
 	for _, job := range jobs {
-		if filepath.Ext(job.Path) != ".kfx-zip" {
-			t.Fatalf("unexpected output path: %q", job.Path)
+		if filepath.Ext(job.Path) != "" {
+			t.Fatalf("output base unexpectedly has an extension: %q", job.Path)
 		}
-	}
-}
-
-func TestRenameBookPDFs(t *testing.T) {
-	directory := t.TempDir()
-	source := filepath.Join(directory, "B0CJGD6G7L.automated.pdf")
-	if err := os.WriteFile(source, []byte("pdf"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	books := []Book{{
-		ID: "B0CJGD6G7L", Title: "Künstliche Intelligenz: Ein moderner Ansatz",
-	}}
-	count, err := RenamePDFs(directory, books, io.Discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if count != 1 {
-		t.Fatalf("renamed %d files, want 1", count)
-	}
-	destination := filepath.Join(directory,
-		"Künstliche Intelligenz - Ein moderner Ansatz.automated.pdf")
-	if _, err := os.Stat(destination); err != nil {
-		t.Fatal(err)
 	}
 }
 

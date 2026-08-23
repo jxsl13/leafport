@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -87,6 +89,62 @@ func TestDecryptBundle(t *testing.T) {
 		return
 	}
 	t.Fatal("main.azw8 not found in output")
+}
+
+func TestDecryptBundleToMemory(t *testing.T) {
+	bundle := t.TempDir()
+	key := []byte("0123456789abcdef")
+	want := []byte("CONT\x01in-memory page")
+	if err := os.WriteFile(filepath.Join(bundle, "main.azw8"), makeTestRecord(t, key, want, false), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	stats, err := DecryptBundleTo(bundle, &output, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 1 || stats.EncryptedRecords != 1 || output.Len() == 0 {
+		t.Fatalf("unexpected output: stats=%+v bytes=%d", stats, output.Len())
+	}
+	archive, err := zip.NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := archive.File[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("payload = %q, want %q", got, want)
+	}
+}
+
+func TestValidateBundleKeyBeforeOutput(t *testing.T) {
+	bundle := t.TempDir()
+	key := []byte("0123456789abcdef")
+	for index := range 4 {
+		name := filepath.Join(bundle, fmt.Sprintf("record-%d.azw8", index))
+		if err := os.WriteFile(name, makeTestRecord(t, key, []byte("page"), false), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	validation, err := ValidateBundleKey(bundle, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validation.Records != 3 || validation.Pages != 3 {
+		t.Fatalf("unexpected validation: %+v", validation)
+	}
+	if _, err := ValidateBundleKey(bundle, []byte("fedcba9876543210")); err == nil {
+		t.Fatal("wrong key passed sample validation")
+	}
 }
 
 func FuzzDecryptRecordDoesNotPanic(f *testing.F) {
