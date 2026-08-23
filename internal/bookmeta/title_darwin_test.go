@@ -39,6 +39,44 @@ func TestTitleReadsLiveWAL(t *testing.T) {
 	}
 }
 
+func TestStoreReusesOnePreparedLookupForMultipleTitles(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "BookData.sqlite")
+	db, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ZBOOK (
+		ZDISPLAYTITLE TEXT, ZBOOKID TEXT, ZPATH TEXT
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct{ id, title string }{
+		{"B000000001", "First"}, {"B000000002", "Second"},
+	} {
+		if _, err := db.Exec(`INSERT INTO ZBOOK VALUES (?, ?, ?)`,
+			row.title, "A:"+row.id+"-0", "/books/"+row.id+"/content"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(context.Background(), database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for id, want := range map[string]string{"B000000001": "First", "B000000002": "Second"} {
+		got, err := store.Title(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("title for %s = %q, want %q", id, got, want)
+		}
+	}
+}
+
 func TestTitleHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

@@ -38,7 +38,7 @@ func TestParsePrivacyFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !config.RedactPersonal || len(config.RedactPatterns) != 2 {
+	if !config.RedactPersonal || len(config.RedactPatterns) != 2 || config.PreparedPrivacy == nil {
 		t.Fatalf("config = %+v", config)
 	}
 	for _, arguments := range [][]string{

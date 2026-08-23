@@ -106,18 +106,57 @@ func DiscoverRoots(home, override string) ([]Root, error) {
 func DiscoverBooks(ctx context.Context, roots []Root) ([]Book, []error, error) {
 	booksByPath := make(map[string]Book)
 	var warnings []error
+	type storeResult struct {
+		store *bookmeta.Store
+		err   error
+	}
+	metadataStores := make(map[string]storeResult)
+	closeMetadataStores := func() error {
+		var closeErr error
+		for path, result := range metadataStores {
+			if result.store != nil {
+				closeErr = errors.Join(closeErr,
+					wrapPathError("close book metadata", path, result.store.Close()))
+			}
+		}
+		return closeErr
+	}
 	for _, root := range roots {
 		if err := ctx.Err(); err != nil {
-			return nil, warnings, err
+			return nil, warnings, errors.Join(err, closeMetadataStores())
 		}
 		books, rootWarnings, err := discoverBooksInRoot(ctx, root)
 		if err != nil {
-			return nil, warnings, err
+			return nil, warnings, errors.Join(err, closeMetadataStores())
 		}
 		warnings = append(warnings, rootWarnings...)
+		if len(books) != 0 && root.MetadataDB != "" {
+			result, found := metadataStores[root.MetadataDB]
+			if !found {
+				result.store, result.err = bookmeta.Open(ctx, root.MetadataDB)
+				metadataStores[root.MetadataDB] = result
+				if result.err != nil {
+					warnings = append(warnings, result.err)
+				}
+			}
+			if result.store != nil {
+				for index := range books {
+					books[index].Title, err = result.store.Title(ctx, books[index].ID)
+					if err != nil {
+						if ctxErr := ctx.Err(); ctxErr != nil {
+							return nil, warnings, errors.Join(ctxErr, closeMetadataStores())
+						}
+						warnings = append(warnings, fmt.Errorf("read title for %s: %w", books[index].ID, err))
+					}
+				}
+			}
+		}
 		for _, book := range books {
 			booksByPath[book.Path] = book
 		}
+	}
+	if err := closeMetadataStores(); err != nil {
+		warnings = append(warnings, err)
 	}
 	books := make([]Book, 0, len(booksByPath))
 	for _, book := range booksByPath {
@@ -130,6 +169,13 @@ func DiscoverBooks(ctx context.Context, roots []Root) ([]Book, []error, error) {
 		return books[i].Modified.After(books[j].Modified)
 	})
 	return books, warnings, nil
+}
+
+func wrapPathError(operation, path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s %s: %w", operation, path, err)
 }
 
 // Filter returns books whose title or ID matches pattern.
@@ -287,7 +333,12 @@ func discoverBooksInRoot(ctx context.Context, root Root) ([]Book, []error, error
 	if err != nil {
 		return nil, nil, err
 	}
-	candidates := make(map[string]time.Time)
+	type bundleCandidate struct {
+		modified   time.Time
+		hasContent bool
+		hasVoucher bool
+	}
+	candidates := make(map[string]bundleCandidate)
 	err = filepath.WalkDir(absolute, func(path string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -295,14 +346,27 @@ func discoverBooksInRoot(ctx context.Context, root Root) ([]Book, []error, error
 		if walkErr != nil {
 			return walkErr
 		}
-		if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".azw8" {
+		if entry.IsDir() {
 			return nil
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
+		directory := filepath.Dir(path)
+		candidate := candidates[directory]
+		switch strings.ToLower(filepath.Ext(entry.Name())) {
+		case ".voucher":
+			candidate.hasVoucher = true
+		case ".azw8":
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			candidate.hasContent = true
+			if info.ModTime().After(candidate.modified) {
+				candidate.modified = info.ModTime()
+			}
+		default:
+			return nil
 		}
-		candidates[filepath.Dir(path)] = info.ModTime()
+		candidates[directory] = candidate
 		return nil
 	})
 	if err != nil {
@@ -310,8 +374,8 @@ func discoverBooksInRoot(ctx context.Context, root Root) ([]Book, []error, error
 	}
 	books := make([]Book, 0, len(candidates))
 	var warnings []error
-	for directory, modified := range candidates {
-		if !hasSuffixFile(directory, ".voucher") {
+	for directory, candidate := range candidates {
+		if !candidate.hasContent || !candidate.hasVoucher {
 			continue
 		}
 		relative, err := filepath.Rel(absolute, directory)
@@ -319,13 +383,9 @@ func discoverBooksInRoot(ctx context.Context, root Root) ([]Book, []error, error
 			continue
 		}
 		id := inferBookID(relative, directory)
-		title, err := bookmeta.Title(ctx, root.MetadataDB, id)
-		if err != nil {
-			warnings = append(warnings, fmt.Errorf("read title for %s: %w", id, err))
-		}
 		books = append(books, Book{
-			ID: id, Title: title, Path: directory,
-			Preferences: root.Preferences, Modified: modified,
+			ID: id, Path: directory,
+			Preferences: root.Preferences, Modified: candidate.modified,
 		})
 	}
 	return books, warnings, nil
@@ -359,17 +419,4 @@ func isASIN(value string) bool {
 		}
 	}
 	return true
-}
-
-func hasSuffixFile(directory, suffix string) bool {
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		return false
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), suffix) {
-			return true
-		}
-	}
-	return false
 }

@@ -3,6 +3,8 @@ package exporter
 import (
 	"bytes"
 	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -59,5 +61,51 @@ func TestArchiveSpillWriterUsesPrivateFileAboveLimit(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("spill permissions = %o", info.Mode().Perm())
+	}
+}
+
+func TestBatchReaderHomeIsPreparedOncePerPreferencesFile(t *testing.T) {
+	root := t.TempDir()
+	preferences := filepath.Join(t.TempDir(), "reader.plist")
+	if err := os.WriteFile(preferences, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	batch := &Batch{
+		root: root, environment: []string{"PATH=/usr/bin"},
+		homes: make(map[string]batchHome), homeErrors: make(map[string]error),
+	}
+	first, err := batch.readerHome(preferences)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(preferences, []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := batch.readerHome(preferences)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.path != second.path || !reflect.DeepEqual(first.environment, second.environment) {
+		t.Fatalf("reader home was rebuilt: first=%+v second=%+v", first, second)
+	}
+	copyPath := filepath.Join(first.path, "Library", "Preferences", "com.amazon.Lassen.plist")
+	data, err := os.ReadFile(copyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "original" {
+		t.Fatalf("prepared preferences changed: %q", data)
+	}
+}
+
+func TestVoucherRequirementArgument(t *testing.T) {
+	required, notRequired := true, false
+	for _, test := range []struct {
+		value *bool
+		want  string
+	}{{nil, "auto"}, {&required, "account-secret"}, {&notRequired, "dsn"}} {
+		if got := voucherRequirementArgument(test.value); got != test.want {
+			t.Fatalf("argument = %q, want %q", got, test.want)
+		}
 	}
 }

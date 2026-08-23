@@ -100,6 +100,14 @@ func parse(program string, arguments []string, output io.Writer) (app.Config, er
 	if err := validate(config); err != nil {
 		return app.Config{}, err
 	}
+	privacy, err := kfxconvert.PreparePrivacyOptions(kfxconvert.PrivacyOptions{
+		DetectPersonal: config.RedactPersonal,
+		Patterns:       config.RedactPatterns,
+	})
+	if err != nil {
+		return app.Config{}, err
+	}
+	config.PreparedPrivacy = &privacy
 	return config, nil
 }
 
@@ -146,12 +154,6 @@ func validate(config app.Config) error {
 	}
 	if config.List && (config.RedactPersonal || len(config.RedactPatterns) != 0) {
 		return errors.New("--redact-personal and --redact are only valid with --target")
-	}
-	if err := kfxconvert.ValidatePrivacyOptions(kfxconvert.PrivacyOptions{
-		DetectPersonal: config.RedactPersonal,
-		Patterns:       config.RedactPatterns,
-	}); err != nil {
-		return err
 	}
 	if !config.List && config.Target == "" {
 		return errors.New("--target is required (or use --list)")

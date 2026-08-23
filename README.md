@@ -212,8 +212,10 @@ or media with private permissions for source-vs-output diagnostics.
 ## Implementation and compatibility
 
 Leafport reads titles through `database/sql` and the cgo-free
-`modernc.org/sqlite` driver. It creates a disposable, ad-hoc-signed copy of the
-reader runtime, captures the per-book content key in memory, decrypts DRMION
+`modernc.org/sqlite` driver. A batch opens each metadata database once and
+creates one disposable, ad-hoc-signed copy of the reader runtime and Go bridge.
+Every book still runs in a separate short-lived process, captures its content
+key in memory, decrypts DRMION
 records in Go, parses Binary Ion/KFX in Go, and writes validated PDF, EPUB, or
 CBZ output. EPUB packaging follows EPUB 3/OCF rules, including an uncompressed,
 descriptor-free first `mimetype` entry. Reconstructed navigation includes the

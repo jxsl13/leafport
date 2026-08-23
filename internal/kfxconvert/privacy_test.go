@@ -28,6 +28,25 @@ func TestValidatePrivacyOptions(t *testing.T) {
 	}
 }
 
+func TestPreparePrivacyOptionsReusesCompiledPatterns(t *testing.T) {
+	prepared, err := PreparePrivacyOptions(PrivacyOptions{Patterns: []string{"Jane", "Doe"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := compiledPrivacyPatterns(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := compiledPrivacyPatterns(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || first[0] != second[0] || first[1] != second[1] {
+		t.Fatalf("compiled patterns were rebuilt: first=%p/%p second=%p/%p",
+			first[0], first[1], second[0], second[1])
+	}
+}
+
 func TestRedactTextCleansExternalTitles(t *testing.T) {
 	output, err := RedactText("Licensed to Jane Doe — jane@example.com", PrivacyOptions{
 		DetectPersonal: true,

@@ -14,6 +14,7 @@ import (
 type PrivacyOptions struct {
 	DetectPersonal bool
 	Patterns       []string
+	compiled       []*regexp.Regexp
 }
 
 // PrivacyResult reports privacy work without exposing the values found.
@@ -31,19 +32,54 @@ var metadataEmailPattern = regexp.MustCompile(`(?i)[a-z0-9.!#$%&'*+/=?^_` + "`" 
 
 // ValidatePrivacyOptions validates patterns before any output is created.
 func ValidatePrivacyOptions(options PrivacyOptions) error {
-	for index, pattern := range options.Patterns {
+	_, err := compiledPrivacyPatterns(options)
+	return err
+}
+
+// PreparePrivacyOptions validates and compiles explicit patterns once for a
+// multi-book conversion. The returned value remains safe to pass by value.
+func PreparePrivacyOptions(options PrivacyOptions) (PrivacyOptions, error) {
+	options.Patterns = append([]string(nil), options.Patterns...)
+	compiled, err := compilePrivacyPatterns(options.Patterns)
+	if err != nil {
+		return PrivacyOptions{}, err
+	}
+	options.compiled = compiled
+	return options, nil
+}
+
+func compilePrivacyPatterns(patterns []string) ([]*regexp.Regexp, error) {
+	compiledPatterns := make([]*regexp.Regexp, 0, len(patterns))
+	for index, pattern := range patterns {
 		if strings.TrimSpace(pattern) == "" {
-			return fmt.Errorf("--redact pattern %d is empty", index+1)
+			return nil, fmt.Errorf("--redact pattern %d is empty", index+1)
 		}
 		compiled, err := regexp.Compile(pattern)
 		if err != nil {
-			return fmt.Errorf("invalid --redact pattern %d: %w", index+1, err)
+			return nil, fmt.Errorf("invalid --redact pattern %d: %w", index+1, err)
 		}
 		if compiled.MatchString("") {
-			return fmt.Errorf("--redact pattern %d matches empty text", index+1)
+			return nil, fmt.Errorf("--redact pattern %d matches empty text", index+1)
+		}
+		compiledPatterns = append(compiledPatterns, compiled)
+	}
+	return compiledPatterns, nil
+}
+
+func compiledPrivacyPatterns(options PrivacyOptions) ([]*regexp.Regexp, error) {
+	if len(options.compiled) == len(options.Patterns) {
+		matches := true
+		for index, compiled := range options.compiled {
+			if compiled == nil || compiled.String() != options.Patterns[index] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return options.compiled, nil
 		}
 	}
-	return nil
+	return compilePrivacyPatterns(options.Patterns)
 }
 
 // RedactText applies explicit patterns and contextual automatic email
@@ -51,10 +87,11 @@ func ValidatePrivacyOptions(options PrivacyOptions) error {
 // title used for an output file name. A bare email is not assumed to identify
 // the owner because it can legitimately belong to an author or publisher.
 func RedactText(value string, options PrivacyOptions) (string, error) {
-	if err := ValidatePrivacyOptions(options); err != nil {
+	patterns, err := compiledPrivacyPatterns(options)
+	if err != nil {
 		return "", err
 	}
-	patterns := append([]string(nil), options.Patterns...)
+	redactor := &personalRedactor{patterns: append([]*regexp.Regexp(nil), patterns...)}
 	if options.DetectPersonal && hasPersonalContext(value) {
 		seen := make(map[string]struct{})
 		for _, email := range metadataEmailPattern.FindAllString(value, -1) {
@@ -62,16 +99,9 @@ func RedactText(value string, options PrivacyOptions) (string, error) {
 				continue
 			}
 			seen[strings.ToLower(email)] = struct{}{}
-			patterns = append(patterns, `(?i:`+regexp.QuoteMeta(email)+`)`)
+			redactor.patterns = append(redactor.patterns,
+				regexp.MustCompile(`(?i:`+regexp.QuoteMeta(email)+`)`))
 		}
-	}
-	redactor := &personalRedactor{}
-	for _, pattern := range patterns {
-		compiled, err := regexp.Compile(pattern)
-		if err != nil {
-			return "", err
-		}
-		redactor.patterns = append(redactor.patterns, compiled)
 	}
 	return redactor.redact(value), nil
 }
@@ -81,11 +111,11 @@ func applyPrivacy(book *decodedBook, options PrivacyOptions) (PrivacyResult, err
 	if !result.Enabled {
 		return result, nil
 	}
-	if err := ValidatePrivacyOptions(options); err != nil {
+	patterns, err := compiledPrivacyPatterns(options)
+	if err != nil {
 		return PrivacyResult{}, err
 	}
 
-	patterns := append([]string(nil), options.Patterns...)
 	automatic := make(map[string]struct{})
 	if options.DetectPersonal {
 		for category, entries := range book.metadata {
@@ -114,16 +144,10 @@ func applyPrivacy(book *decodedBook, options PrivacyOptions) (PrivacyResult, err
 		values = append(values, value)
 	}
 	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
+	redactor := &personalRedactor{patterns: append([]*regexp.Regexp(nil), patterns...)}
 	for _, value := range values {
-		patterns = append(patterns, `(?i:`+regexp.QuoteMeta(value)+`)`)
-	}
-	redactor := &personalRedactor{}
-	for _, pattern := range patterns {
-		compiled, err := regexp.Compile(pattern)
-		if err != nil {
-			return PrivacyResult{}, err
-		}
-		redactor.patterns = append(redactor.patterns, compiled)
+		redactor.patterns = append(redactor.patterns,
+			regexp.MustCompile(`(?i:`+regexp.QuoteMeta(value)+`)`))
 	}
 	book.privacy = redactor
 	result.AutomaticValues = len(values)

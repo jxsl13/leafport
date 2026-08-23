@@ -56,6 +56,10 @@ type KeyValidation struct {
 // memory. This rejects a wrong or stale captured key before creating the
 // destination archive.
 func ValidateBundleKey(bundle string, key []byte) (validation KeyValidation, err error) {
+	block, err := contentCipher(key)
+	if err != nil {
+		return validation, err
+	}
 	entries, err := os.ReadDir(bundle)
 	if err != nil {
 		return validation, fmt.Errorf("read bundle: %w", err)
@@ -87,7 +91,7 @@ func ValidateBundleKey(bundle string, key []byte) (validation KeyValidation, err
 		if !containsAnnotated(values, sidEncryptedPageV1, sidEncryptedPageV2) {
 			continue
 		}
-		plaintext, pages, decryptErr := DecryptRecord(data, key)
+		plaintext, pages, decryptErr := decryptRecord(data, block)
 		clear(plaintext)
 		if decryptErr != nil {
 			return validation, fmt.Errorf("%s: %w", entry.Name(), decryptErr)
@@ -106,9 +110,21 @@ func ValidateBundleKey(bundle string, key []byte) (validation KeyValidation, err
 
 // DecryptRecord converts one complete DRMION record into its KFX payload.
 func DecryptRecord(record, key []byte) ([]byte, int, error) {
-	if len(key) < aes.BlockSize {
-		return nil, 0, fmt.Errorf("content key is %d bytes; need at least %d", len(key), aes.BlockSize)
+	block, err := contentCipher(key)
+	if err != nil {
+		return nil, 0, err
 	}
+	return decryptRecord(record, block)
+}
+
+func contentCipher(key []byte) (cipher.Block, error) {
+	if len(key) < aes.BlockSize {
+		return nil, fmt.Errorf("content key is %d bytes; need at least %d", len(key), aes.BlockSize)
+	}
+	return aes.NewCipher(key[:aes.BlockSize])
+}
+
+func decryptRecord(record []byte, block cipher.Block) ([]byte, int, error) {
 	const footerLength = 8
 	if len(record) < len(drmIonPrefix)+footerLength ||
 		!bytes.Equal(record[:len(drmIonPrefix)], drmIonPrefix) {
@@ -129,7 +145,7 @@ func DecryptRecord(record, key []byte) ([]byte, int, error) {
 		for _, item := range items {
 			switch {
 			case item.hasAnnotation(sidEncryptedPageV1) || item.hasAnnotation(sidEncryptedPageV2):
-				page, pageErr := decryptPage(item, key[:aes.BlockSize])
+				page, pageErr := decryptPage(item, block)
 				if pageErr != nil {
 					return fmt.Errorf("decrypt page %d: %w", pages+1, pageErr)
 				}
@@ -164,7 +180,7 @@ func DecryptRecord(record, key []byte) ([]byte, int, error) {
 	return output.Bytes(), pages, nil
 }
 
-func decryptPage(page *ionValue, key []byte) ([]byte, error) {
+func decryptPage(page *ionValue, block cipher.Block) ([]byte, error) {
 	var ciphertext, iv []byte
 	compressed := false
 	for _, field := range page.children {
@@ -184,13 +200,9 @@ func decryptPage(page *ionValue, key []byte) ([]byte, error) {
 	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
 		return nil, fmt.Errorf("ciphertext length %d is not block-aligned", len(ciphertext))
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
 	plaintext := make([]byte, len(ciphertext))
 	cipher.NewCBCDecrypter(block, iv[:aes.BlockSize]).CryptBlocks(plaintext, ciphertext)
-	plaintext, err = unpadPKCS7(plaintext, aes.BlockSize)
+	plaintext, err := unpadPKCS7(plaintext, aes.BlockSize)
 	if err != nil {
 		return nil, err
 	}
@@ -304,6 +316,10 @@ func DecryptBundle(bundle, destination string, key []byte) (stats Stats, err err
 // stream it through an anonymous pipe without creating a plaintext temporary
 // file.
 func DecryptBundleTo(bundle string, destination io.Writer, key []byte) (stats Stats, err error) {
+	block, err := contentCipher(key)
+	if err != nil {
+		return stats, err
+	}
 	entries, err := os.ReadDir(bundle)
 	if err != nil {
 		return stats, fmt.Errorf("read bundle: %w", err)
@@ -328,7 +344,7 @@ func DecryptBundleTo(bundle string, destination io.Writer, key []byte) (stats St
 		encrypted := isDRMION(data)
 		if encrypted {
 			var pages int
-			data, pages, readErr = DecryptRecord(data, key)
+			data, pages, readErr = decryptRecord(data, block)
 			if readErr != nil {
 				return stats, fmt.Errorf("%s: %w", entry.Name(), readErr)
 			}

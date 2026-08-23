@@ -21,16 +21,17 @@ import (
 
 // Config contains values parsed from the command line.
 type Config struct {
-	AppPath        string
-	Library        string
-	Match          string
-	Output         string
-	Target         string
-	AccountSecret  string
-	RedactPatterns []string
-	List           bool
-	Debug          bool
-	RedactPersonal bool
+	AppPath         string
+	Library         string
+	Match           string
+	Output          string
+	Target          string
+	AccountSecret   string
+	RedactPatterns  []string
+	PreparedPrivacy *kfxconvert.PrivacyOptions
+	List            bool
+	Debug           bool
+	RedactPersonal  bool
 }
 
 // Streams contains the process streams used by the application and bridge.
@@ -134,6 +135,14 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		DetectPersonal: config.RedactPersonal,
 		Patterns:       config.RedactPatterns,
 	}
+	if config.PreparedPrivacy != nil {
+		privacy = *config.PreparedPrivacy
+	} else {
+		privacy, err = kfxconvert.PreparePrivacyOptions(privacy)
+		if err != nil {
+			return err
+		}
+	}
 	if privacy.DetectPersonal || len(privacy.Patterns) != 0 {
 		books = append([]library.Book(nil), books...)
 		for index := range books {
@@ -145,6 +154,7 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		}
 	}
 	outputs := library.PlanOutputs(books, target)
+	outputStates := inspectBatchOutputs(outputs)
 	fmt.Fprintf(streams.Stdout, "Exporting %d book(s)\nTarget: %s\n", len(outputs), target)
 	debugRoot := ""
 	if config.Debug && len(outputs) != 0 {
@@ -161,7 +171,14 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 	succeeded := 0
 	skipped := 0
 	workRoot := ""
+	var exportBatch *exporter.Batch
+	var exportBatchErr error
 	defer func() {
+		if exportBatch != nil {
+			if cleanupErr := exportBatch.Close(); cleanupErr != nil {
+				err = errors.Join(err, cleanupErr)
+			}
+		}
 		if workRoot != "" {
 			if cleanupErr := os.RemoveAll(workRoot); cleanupErr != nil {
 				err = errors.Join(err, cleanupErr)
@@ -169,7 +186,7 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		}
 	}()
 	var failures []error
-	accountSecrets := preflightAccountSecrets(ctx, config, outputs)
+	accountSecrets := preflightAccountSecrets(ctx, config, outputs, outputStates)
 	for _, notice := range accountSecrets.notices {
 		fmt.Fprintln(streams.Stdout, notice)
 	}
@@ -178,6 +195,7 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 	}
 	reporter := batchReporter{output: streams.Stdout}
 	for index, output := range outputs {
+		state := outputStates[index]
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			failures = append(failures, ctxErr)
 			break
@@ -189,9 +207,9 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 			reporter.field("Status", "failed")
 			reporter.field("Reason", cause.Error())
 		}
-		existing, statErr := existingPublication(output.Path)
-		if statErr != nil {
-			recordFailure(fmt.Errorf("inspect output: %w", statErr))
+		existing := state.existing
+		if state.existingErr != nil {
+			recordFailure(fmt.Errorf("inspect output: %w", state.existingErr))
 			continue
 		}
 		if existing != "" && !config.Debug {
@@ -213,22 +231,17 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 			}
 			reporter.field("Encrypted", filepath.Join(debugBookRoot, "encrypted"))
 		}
-		archivePath := output.Path + ".kfx-zip"
+		archivePath := state.archivePath
 		var archiveData []byte
-		var archiveSize int64
-		archiveInfo, archiveErr := os.Stat(archivePath)
+		archiveSize := state.archiveSize
 		switch {
-		case archiveErr == nil && archiveInfo.IsDir():
-			recordFailure(fmt.Errorf("intermediate archive is a directory: %s", archivePath))
+		case state.archiveErr != nil:
+			recordFailure(state.archiveErr)
 			continue
-		case archiveErr == nil:
-			archiveSize = archiveInfo.Size()
+		case state.archiveExists:
 			reporter.field("Action", "converting existing decrypted archive")
-		case !errors.Is(archiveErr, os.ErrNotExist):
-			recordFailure(fmt.Errorf("inspect intermediate archive: %w", archiveErr))
-			continue
 		default:
-			if block := accountSecrets.blocked[output.Book.ID]; block != nil {
+			if block := accountSecrets.blocked[output.Book.Path]; block != nil {
 				recordFailure(block)
 				continue
 			}
@@ -246,11 +259,23 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 			if accountSecret == "" {
 				accountSecret = accountSecrets.byPreferences[output.Book.Preferences]
 			}
-			exportConfig := exporter.Config{
-				AppPath: config.AppPath, AccountSecret: accountSecret,
-				Stdin: streams.Stdin, Stdout: io.Discard, Stderr: streams.Stderr,
+			if exportBatch == nil && exportBatchErr == nil {
+				exportBatch, exportBatchErr = exporter.NewBatch(exporter.Config{
+					AppPath: config.AppPath,
+					Stdin:   streams.Stdin, Stdout: io.Discard, Stderr: streams.Stderr,
+				}, workRoot)
 			}
-			archive, exportErr := exporter.Export(ctx, exportConfig, output, workRoot)
+			if exportBatchErr != nil {
+				recordFailure(exportBatchErr)
+				continue
+			}
+			var accountSecretRequired *bool
+			if required, known := accountSecrets.voucherAccountSecret[output.Book.Path]; known {
+				accountSecretRequired = &required
+			}
+			archive, exportErr := exportBatch.ExportWithOptions(ctx, output, exporter.BookOptions{
+				AccountSecret: accountSecret, AccountSecretRequired: accountSecretRequired,
+			})
 			if exportErr != nil {
 				recordFailure(exportErr)
 				continue
@@ -327,30 +352,68 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 }
 
 type accountSecretPreflight struct {
-	blocked       map[string]error
-	byPreferences map[string]string
-	notices       []string
+	blocked              map[string]error
+	byPreferences        map[string]string
+	voucherAccountSecret map[string]bool
+	notices              []string
 }
 
-func preflightAccountSecrets(ctx context.Context, config Config, outputs []library.Output) accountSecretPreflight {
+type batchOutputState struct {
+	existing      string
+	existingErr   error
+	archivePath   string
+	archiveSize   int64
+	archiveExists bool
+	archiveErr    error
+}
+
+func inspectBatchOutputs(outputs []library.Output) []batchOutputState {
+	states := make([]batchOutputState, len(outputs))
+	for index, output := range outputs {
+		state := batchOutputState{archivePath: output.Path + ".kfx-zip"}
+		state.existing, state.existingErr = existingPublication(output.Path)
+		info, err := os.Stat(state.archivePath)
+		switch {
+		case err == nil && info.IsDir():
+			state.archiveErr = fmt.Errorf("intermediate archive is a directory: %s", state.archivePath)
+		case err == nil:
+			state.archiveExists = true
+			state.archiveSize = info.Size()
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			state.archiveErr = fmt.Errorf("inspect intermediate archive: %w", err)
+		}
+		states[index] = state
+	}
+	return states
+}
+
+func preflightAccountSecrets(ctx context.Context, config Config, outputs []library.Output, states []batchOutputState) accountSecretPreflight {
 	result := accountSecretPreflight{
-		blocked:       make(map[string]error),
-		byPreferences: make(map[string]string),
+		blocked:              make(map[string]error),
+		byPreferences:        make(map[string]string),
+		voucherAccountSecret: make(map[string]bool),
 	}
 	if config.AccountSecret != "" {
 		return result
 	}
 	groups := make(map[string][]library.Book)
-	for _, output := range outputs {
+	for index, output := range outputs {
 		book := output.Book
-		if existing, _ := existingPublication(output.Path); existing != "" && !config.Debug {
+		state := states[index]
+		if state.existingErr != nil || state.archiveErr != nil || state.existing != "" && !config.Debug {
 			continue
 		}
-		if info, err := os.Stat(output.Path + ".kfx-zip"); err == nil && info.Mode().IsRegular() {
+		if state.archiveExists {
 			continue
 		}
 		requirements, err := readerconfig.InspectVouchers(book.Path)
-		if err == nil && requirements.AccountSecret {
+		if err != nil {
+			result.blocked[book.Path] = err
+			continue
+		}
+		result.voucherAccountSecret[book.Path] = requirements.AccountSecret
+		if requirements.AccountSecret {
 			groups[book.Preferences] = append(groups[book.Preferences], book)
 		}
 	}
@@ -400,7 +463,7 @@ func preflightAccountSecrets(ctx context.Context, config Config, outputs []libra
 		}
 		detail += "; run \"leafport doctor\" for details"
 		for _, book := range group {
-			result.blocked[book.ID] = errors.New(detail)
+			result.blocked[book.Path] = errors.New(detail)
 		}
 		result.notices = append(result.notices, fmt.Sprintf(
 			"Credential check: %d selected book(s) require an unavailable account secret.", len(group)))

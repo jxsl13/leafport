@@ -5,6 +5,7 @@ package runtimebridge
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -76,7 +77,35 @@ func OpenBook(runtimePath, bundlePath, preferencesPath, resourcesPath string) (C
 // OpenBookWithAccountSecret opens a book with an optional caller-supplied raw
 // device account secret. The value is used only in this short-lived process.
 func OpenBookWithAccountSecret(runtimePath, bundlePath, preferencesPath, resourcesPath, accountSecret string) (Capture, error) {
-	fingerprint, profile, knownProfile, err := runtimeProfile(runtimePath)
+	return openBook(runtimePath, bundlePath, preferencesPath, resourcesPath, accountSecret, nil, nil)
+}
+
+// OpenBookWithPreparedRuntime reuses the fingerprint calculated while the
+// private runtime copy was created. The copy lives in a mode-0700 batch
+// directory and is still independently checked when symbols are resolved.
+func OpenBookWithPreparedRuntime(runtimePath, bundlePath, preferencesPath, resourcesPath, accountSecret string, accountSecretRequired *bool, fingerprint machoutil.BinaryFingerprint) (Capture, error) {
+	return openBook(runtimePath, bundlePath, preferencesPath, resourcesPath, accountSecret, accountSecretRequired, &fingerprint)
+}
+
+func openBook(runtimePath, bundlePath, preferencesPath, resourcesPath, accountSecret string, accountSecretRequired *bool, preparedFingerprint *machoutil.BinaryFingerprint) (Capture, error) {
+	var (
+		fingerprint  machoutil.BinaryFingerprint
+		profile      compatibility.Profile
+		knownProfile bool
+		err          error
+	)
+	if preparedFingerprint == nil {
+		fingerprint, profile, knownProfile, err = runtimeProfile(runtimePath)
+	} else {
+		fingerprint = *preparedFingerprint
+		if len(fingerprint.TextSHA256) != 64 {
+			return Capture{}, errors.New("prepared runtime fingerprint has an invalid text hash")
+		}
+		if _, err = hex.DecodeString(fingerprint.TextSHA256); err != nil {
+			return Capture{}, errors.New("prepared runtime fingerprint text hash is not hexadecimal")
+		}
+		profile, knownProfile = compatibility.Resolve(fingerprint.UUID, fingerprint.TextSHA256)
+	}
 	if err != nil {
 		return Capture{}, err
 	}
@@ -108,11 +137,17 @@ func OpenBookWithAccountSecret(runtimePath, bundlePath, preferencesPath, resourc
 		}
 		credentials.AccountSecrets = []string{accountSecret}
 	}
-	requirements, err := readerconfig.InspectVouchers(bundlePath)
-	if err != nil {
-		return Capture{}, err
+	requiresAccountSecret := false
+	if accountSecretRequired == nil {
+		requirements, err := readerconfig.InspectVouchers(bundlePath)
+		if err != nil {
+			return Capture{}, err
+		}
+		requiresAccountSecret = requirements.AccountSecret
+	} else {
+		requiresAccountSecret = *accountSecretRequired
 	}
-	if requirements.AccountSecret && len(credentials.AccountSecrets) == 0 {
+	if requiresAccountSecret && len(credentials.AccountSecrets) == 0 {
 		secret, secretErr := runtimeAccountSecret()
 		if secretErr == nil {
 			credentials.AccountSecrets = []string{secret}

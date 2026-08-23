@@ -45,6 +45,10 @@ func OpenBookWithAccountSecret(_, _, _, _, _ string) (Capture, error) {
 	return Capture{}, errors.New("reader runtime bridge requires macOS")
 }
 
+func OpenBookWithPreparedRuntime(_, _, _, _, _ string, _ *bool, _ machoutil.BinaryFingerprint) (Capture, error) {
+	return Capture{}, errors.New("reader runtime bridge requires macOS")
+}
+
 func Doctor(_, _ string) (DoctorReport, error) {
 	return DoctorReport{}, errors.New("reader runtime bridge requires macOS")
 }
