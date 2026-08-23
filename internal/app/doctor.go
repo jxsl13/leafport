@@ -38,7 +38,7 @@ func Doctor(ctx context.Context, config Config, streams Streams) error {
 	state.pass("Final output policy", "PDF-backed/textbook fixed layout -> PDF; explicitly marked image comics -> CBZ; reflowable KFX -> EPUB; no KFX final output")
 	state.pass("Fixed-layout safeguards", "typed capability plus text/page-structure checks; variants, tiles, mixed PDF/images, metadata, navigation, and RTL supported")
 	state.pass("EPUB reconstruction", "text, navigation, links, tables, ruby, MathML, KVG/SVG, fonts, images, and supported audio/video/image plugins; unknown interactive layouts fail closed")
-	state.pass("Privacy cleanup", "owner metadata/email detection, repeatable regular expressions, output metadata removal, and common-media scrubbing; PDF page content and pre-rendered pixels are not rewritten")
+	state.pass("Privacy cleanup", "explicit owner fields, contextual owner markers, repeatable regular expressions, output metadata removal, and common-media scrubbing; publication contact addresses are preserved")
 	state.warn("JPEG-XR", "no independently validated pure-Go decoder is available; an affected fixed-layout title fails closed")
 
 	executable := filepath.Join(config.AppPath, "Contents/MacOS/Kindle")
@@ -64,7 +64,6 @@ func Doctor(ctx context.Context, config Config, streams Streams) error {
 		state.pass("__text SHA-256", staticFingerprint.TextSHA256)
 		checkCredentialFlowAnchors(state, data)
 		checkReaderEntitlements(state, data)
-		state.warn("Automatic account-secret retrieval", "unavailable for the signed Catalyst reader: its Data Protection Keychain group cannot be inherited, and get-task-allow=false prevents attachment even as root")
 	}
 	if info, statErr := os.Stat(resources); statErr != nil || !info.IsDir() {
 		if statErr == nil {
@@ -125,6 +124,26 @@ func Doctor(ctx context.Context, config Config, streams Streams) error {
 	}
 
 	if appReady && runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		if config.AccountSecret == "" && accountSecretBundles != 0 && preferencesPath != "" && home != "" {
+			credentials, credentialsErr := readerconfig.LoadCredentials(preferencesPath)
+			if credentialsErr == nil && credentials.HashedAccountSecret != "" {
+				secret, discovery, discoveryErr := readerconfig.DiscoverAccountSecret(
+					credentials.HashedAccountSecret, readerconfig.DefaultAccountSecretRoots(home))
+				switch {
+				case discoveryErr != nil:
+					state.warn("Reader-owned credential scan", discoveryErr.Error())
+				case secret != "":
+					config.AccountSecret = secret
+					state.pass("Reader-owned credential scan", fmt.Sprintf(
+						"verified one raw value against the stored fingerprint (%d file(s), %d candidate(s))",
+						discovery.Files, discovery.Candidates))
+				default:
+					state.warn("Reader-owned credential scan", fmt.Sprintf(
+						"no verified raw value in %d normally readable file(s); %d exact candidate(s) tested",
+						discovery.Files, discovery.Candidates))
+				}
+			}
+		}
 		report, bridgeErr := exporter.Doctor(ctx, exporter.Config{
 			AppPath: config.AppPath, Preferences: preferencesPath, AccountSecret: config.AccountSecret,
 			Stdin: streams.Stdin, Stderr: streams.Stderr,
@@ -166,6 +185,14 @@ func Doctor(ctx context.Context, config Config, streams Streams) error {
 				}
 				if report.AccountSecretProbeError != "" {
 					detail += "; runtime lookup: " + report.AccountSecretProbeError
+				}
+				if report.EntitlementProbeError != "" {
+					detail += "; reader-entitlement probe: " + report.EntitlementProbeError
+				}
+				if report.EntitlementProbeAttempted {
+					state.warn("Automatic account-secret retrieval", "macOS rejected or denied the disposable reader-entitled bridge; get-task-allow=false also prevents supported attachment, including when invoked as root")
+				} else {
+					state.warn("Automatic account-secret retrieval", "the restricted keychain access group cannot be inherited; get-task-allow=false also prevents supported attachment, including when invoked as root")
 				}
 				state.fail("Account secret", errors.New(detail))
 			} else if report.HashedAccountSecret {

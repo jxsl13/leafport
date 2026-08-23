@@ -54,8 +54,17 @@ func TestDecryptBundle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundle, "main.azw8"), makeTestRecord(t, key, want, true), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bundle, "metadata.kfx"), []byte("metadata"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(bundle, "metadata.kfx"), []byte("CONT\x01metadata"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{
+		"BookManifest.kfx": []byte("SQLite format 3\x00reader manifest"),
+		"book.voucher":     []byte("ACCOUNT_SECRET\x00watermark=license-identifier"),
+		"StartActions.asc": []byte("reader action state"),
+	} {
+		if err := os.WriteFile(filepath.Join(bundle, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	destination := filepath.Join(t.TempDir(), "book.kfx-zip")
 	stats, err := DecryptBundle(bundle, destination, key)
@@ -70,7 +79,13 @@ func TestDecryptBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer archive.Close()
+	if len(archive.File) != 2 {
+		t.Fatalf("archive contains %d entries, want 2 publication containers", len(archive.File))
+	}
 	for _, file := range archive.File {
+		if file.Name == "BookManifest.kfx" || file.Name == "book.voucher" || file.Name == "StartActions.asc" {
+			t.Fatalf("source-side artifact was retained: %s", file.Name)
+		}
 		if file.Name != "main.azw8" {
 			continue
 		}

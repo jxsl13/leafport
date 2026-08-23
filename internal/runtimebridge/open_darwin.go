@@ -54,6 +54,8 @@ type DoctorReport struct {
 	AccountSecretAvailable    bool                        `json:"accountSecretAvailable"`
 	HashedAccountSecret       bool                        `json:"hashedAccountSecret"`
 	AccountSecretProbeError   string                      `json:"accountSecretProbeError,omitempty"`
+	EntitlementProbeAttempted bool                        `json:"entitlementProbeAttempted,omitempty"`
+	EntitlementProbeError     string                      `json:"entitlementProbeError,omitempty"`
 }
 
 type captureState struct {

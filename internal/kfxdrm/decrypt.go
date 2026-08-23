@@ -294,8 +294,15 @@ func DecryptBundle(bundle, destination string, key []byte) (stats Stats, err err
 }
 
 // DecryptBundleTo writes a standalone, unencrypted KFX ZIP to destination.
-// It enables callers to keep the intermediate archive in memory or stream it
-// through an anonymous pipe without creating a plaintext temporary file.
+// Only DRMION and already-plain CONT publication containers are retained.
+// Reader manifests, action state, and DRM vouchers are source-side artifacts;
+// excluding them keeps license watermarks and account-bound material out of
+// both ordinary intermediates and decrypted debug archives. Callers that need
+// those artifacts retain the original encrypted bundle separately.
+//
+// The function enables callers to keep the intermediate archive in memory or
+// stream it through an anonymous pipe without creating a plaintext temporary
+// file.
 func DecryptBundleTo(bundle string, destination io.Writer, key []byte) (stats Stats, err error) {
 	entries, err := os.ReadDir(bundle)
 	if err != nil {
@@ -318,7 +325,8 @@ func DecryptBundleTo(bundle string, destination io.Writer, key []byte) (stats St
 		if readErr != nil {
 			return stats, readErr
 		}
-		if isDRMION(data) {
+		encrypted := isDRMION(data)
+		if encrypted {
 			var pages int
 			data, pages, readErr = DecryptRecord(data, key)
 			if readErr != nil {
@@ -326,6 +334,9 @@ func DecryptBundleTo(bundle string, destination io.Writer, key []byte) (stats St
 			}
 			stats.EncryptedRecords++
 			stats.Pages += pages
+		}
+		if !encrypted && !bytes.HasPrefix(data, []byte("CONT")) {
+			continue
 		}
 		header, headerErr := zip.FileInfoHeader(info)
 		if headerErr != nil {

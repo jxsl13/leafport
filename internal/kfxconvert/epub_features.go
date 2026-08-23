@@ -35,6 +35,13 @@ func validateEPUBFeatureSupport(book *decodedBook) error {
 	}
 	visitIonValues(book.storylines, inspect)
 	visitIonValues(book.templates, inspect)
+	for _, style := range book.styles {
+		for _, field := range style.fields {
+			if !supportedEPUBStyleField(field.id) {
+				unsupported[fmt.Sprintf("style property $%d", field.id)] = true
+			}
+		}
+	}
 	if len(unsupported) == 0 {
 		return nil
 	}
@@ -44,6 +51,19 @@ func validateEPUBFeatureSupport(book *decodedBook) error {
 	}
 	sort.Strings(features)
 	return fmt.Errorf("faithful EPUB reconstruction is not implemented for: %s", strings.Join(features, ", "))
+}
+
+func supportedEPUBStyleField(field uint64) bool {
+	switch field {
+	case 10, 11, 12, 13, 15, 16, 19, 20, 21, 23, 27, 31, 32, 34, 36, 39, 40, 41, 42, 44,
+		47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 62, 63, 64, 65, 70,
+		83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 100,
+		133, 134, 135, 140, 148, 149, 158, 173, 459, 460, 461, 462, 496,
+		546, 554, 576, 577, 580, 583, 633, 761:
+		return true
+	default:
+		return false
+	}
 }
 
 func visitIonValues(values map[uint32]*ionValue, visit func(*ionValue)) {

@@ -68,9 +68,16 @@ type epubFontFace struct {
 type epubNavigationItem struct {
 	label    string
 	href     string
+	epubType string
 	section  int
 	position int
 	children []epubNavigationItem
+}
+
+type epubNavigationDocument struct {
+	toc       []epubNavigationItem
+	landmarks []epubNavigationItem
+	pages     []epubNavigationItem
 }
 
 type epubBuilder struct {
@@ -88,6 +95,8 @@ type epubBuilder struct {
 	nodePositions    map[uint32]int
 	sectionNodeCount map[int]int
 	nodeTextRunes    map[uint32]int
+	positionAnchors  map[uint32]map[int][]string
+	nextPositionID   int
 	templateStack    map[uint32]bool
 	language         string
 }
@@ -115,7 +124,7 @@ func convertBookToEPUB(book *decodedBook, destination string, fallback Metadata)
 		return result, errors.New("KFX publication has no reading order")
 	}
 	builder.indexSections(sectionIDs)
-	navigation := builder.navigationItems()
+	navigation := builder.navigationDocument()
 	sections := make([]epubSection, 0, len(sectionIDs))
 	for index, sectionID := range sectionIDs {
 		section, renderErr := builder.renderSection(sectionID, index+1)
@@ -268,22 +277,21 @@ func (builder *epubBuilder) renderSection(sectionID uint32, number int) (epubSec
 	if section == nil {
 		return epubSection{}, fmt.Errorf("missing section")
 	}
-	storyIDs := uniqueSymbols(ionFieldValue(section, 141), 176)
+	pageTemplates := ionFieldValue(section, 141)
+	storyIDs := uniqueSymbols(pageTemplates, 176)
 	if len(storyIDs) == 0 {
 		return epubSection{}, errors.New("section has no page-template storyline")
 	}
 	var body strings.Builder
 	title := "Section " + strconv.Itoa(number)
-	for _, storyID := range storyIDs {
-		fragment, heading, err := builder.renderStory(storyID, make(map[uint32]bool))
-		if err != nil {
-			return epubSection{}, err
-		}
-		if heading != "" && strings.HasPrefix(title, "Section ") {
-			title = heading
-		}
-		body.WriteString(fragment)
+	fragment, heading, err := builder.renderValues(pageTemplates, 0, make(map[uint32]bool), 0)
+	if err != nil {
+		return epubSection{}, err
 	}
+	if heading != "" {
+		title = heading
+	}
+	body.WriteString(fragment)
 	if strings.HasPrefix(title, "Section ") {
 		for _, storyID := range storyIDs {
 			if candidate := builder.firstStoryText(storyID, make(map[uint32]bool)); candidate != "" {
@@ -428,6 +436,20 @@ func (builder *epubBuilder) renderValues(value *ionValue, storyID uint32, stack 
 				}
 				tag := "h" + strconv.FormatInt(level, 10)
 				return "<" + tag + attributes + ">" + content + "</" + tag + ">", strings.TrimSpace(text), nil
+			}
+			if classification, ok := ionSymbolID(ionFieldValue(value, 615)); ok {
+				switch classification {
+				case 618, 281:
+					return `<aside epub:type="footnote"` + attributes + `>` + content + `</aside>`, "", nil
+				case 619:
+					return `<aside epub:type="endnote"` + attributes + `>` + content + `</aside>`, "", nil
+				case 688:
+					return `<span role="math"` + attributes + `>` + content + `</span>`, "", nil
+				case 453:
+					if parentKind == 278 {
+						return "<caption" + attributes + ">" + content + "</caption>", "", nil
+					}
+				}
 			}
 			if parentKind == 279 {
 				return "<td" + attributes + ">" + content + "</td>", "", nil
@@ -740,25 +762,40 @@ func fontStretch(value *ionValue) string {
 	}[id]
 }
 
-func buildNavigation(title, language string, sections []epubSection, navigation []epubNavigationItem) string {
+func buildNavigation(title, language string, sections []epubSection, navigation epubNavigationDocument) string {
 	var items strings.Builder
-	if len(navigation) != 0 {
-		writeNavigationItems(&items, navigation)
+	if len(navigation.toc) != 0 {
+		writeNavigationItems(&items, navigation.toc)
 	} else {
 		for _, section := range sections {
 			items.WriteString(`<li><a href="` + escapeXML(section.path) + `">` + escapeXML(section.title) + `</a></li>`)
 		}
 	}
+	var supplemental strings.Builder
+	if len(navigation.landmarks) != 0 {
+		supplemental.WriteString(`<nav epub:type="landmarks"><h2>Landmarks</h2><ol>`)
+		writeNavigationItems(&supplemental, navigation.landmarks)
+		supplemental.WriteString(`</ol></nav>`)
+	}
+	if len(navigation.pages) != 0 {
+		supplemental.WriteString(`<nav epub:type="page-list"><h2>Pages</h2><ol>`)
+		writeNavigationItems(&supplemental, navigation.pages)
+		supplemental.WriteString(`</ol></nav>`)
+	}
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="` + escapeXML(language) + `">
 <head><meta charset="UTF-8"/><title>` + escapeXML(title) + `</title></head>
-<body><nav epub:type="toc" id="toc"><h1>` + escapeXML(title) + `</h1><ol>` + items.String() + `</ol></nav></body></html>`
+<body><nav epub:type="toc" id="toc"><h1>` + escapeXML(title) + `</h1><ol>` + items.String() + `</ol></nav>` + supplemental.String() + `</body></html>`
 }
 
 func writeNavigationItems(output *strings.Builder, items []epubNavigationItem) {
 	for _, item := range items {
-		output.WriteString(`<li><a href="` + escapeXML(item.href) + `">` + escapeXML(item.label) + `</a>`)
+		output.WriteString(`<li><a`)
+		if item.epubType != "" {
+			output.WriteString(` epub:type="` + escapeXML(item.epubType) + `"`)
+		}
+		output.WriteString(` href="` + escapeXML(item.href) + `">` + escapeXML(item.label) + `</a>`)
 		if len(item.children) != 0 {
 			output.WriteString("<ol>")
 			writeNavigationItems(output, item.children)

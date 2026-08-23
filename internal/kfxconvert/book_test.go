@@ -2,9 +2,11 @@ package kfxconvert
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +73,53 @@ func TestCollectMetadataRetainsNumericCapabilities(t *testing.T) {
 	value := book.metadataValue("kindle_capability_metadata", "yj_fixed_layout")
 	if number, ok := ionInteger(value); !ok || number != 3 {
 		t.Fatalf("capability = %#v", value)
+	}
+}
+
+func TestFeatureInventoryContainsOnlySortedSemanticIDs(t *testing.T) {
+	book := &decodedBook{
+		entities: map[uint32]map[uint32]*ionValue{260: {}, 157: {}},
+		styles:   map[uint32]*ionValue{1: testStruct(testField(42, testInteger(1)), testField(11, testString("serif")))},
+		storylines: map[uint32]*ionValue{1: testStruct(testField(146, testList(testStruct(
+			testField(159, testSymbol(269)), testField(156, testSymbol(323)),
+			testField(615, testSymbol(619)), testField(683, testList(testStruct(testField(687, testSymbol(690))))),
+		))))},
+		sections:  map[uint32]*ionValue{},
+		templates: map[uint32]*ionValue{},
+		resources: map[uint32]resource{1: {format: 565}, 2: {format: 284}},
+	}
+	got := book.featureInventory()
+	if fmt.Sprint(got.EntityTypes) != "[157 260]" || fmt.Sprint(got.ContentTypes) != "[269]" ||
+		fmt.Sprint(got.Layouts) != "[323]" || fmt.Sprint(got.StyleFields) != "[11 42]" ||
+		fmt.Sprint(got.AnnotationTypes) != "[690]" || fmt.Sprint(got.Classifications) != "[619]" ||
+		fmt.Sprint(got.ResourceFormats) != "[284 565]" {
+		t.Fatalf("inventory = %+v", got)
+	}
+}
+
+func TestDebugResourceExtensionUsesContentSignatures(t *testing.T) {
+	for name, test := range map[string]struct {
+		data []byte
+		want string
+	}{
+		"pdf":  {[]byte("%PDF-1.7\n"), "pdf"},
+		"jpeg": {[]byte{0xff, 0xd8, 0xff, 0xe0}, "jpg"},
+		"font": {[]byte("OTTOfont"), "otf"},
+		"raw":  {[]byte("opaque"), "bin"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := debugResourceExtension(test.data); got != test.want {
+				t.Fatalf("extension = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestEPUBFeatureValidationRejectsUnknownStyleProperty(t *testing.T) {
+	book := &decodedBook{styles: map[uint32]*ionValue{1: testStruct(testField(999, testInteger(1)))}}
+	err := validateEPUBFeatureSupport(book)
+	if err == nil || !strings.Contains(err.Error(), "style property $999") {
+		t.Fatalf("validation error = %v", err)
 	}
 }
 

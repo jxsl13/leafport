@@ -15,6 +15,7 @@ type inlineStyleEvent struct {
 	end   int
 	class string
 	href  string
+	note  bool
 }
 
 type inlineRuby struct {
@@ -35,54 +36,54 @@ func (builder *epubBuilder) indexSections(sectionIDs []uint32) {
 		// Keep both forms addressable through the same section index.
 		builder.sectionSections[sectionID] = index + 1
 		section := builder.book.sections[sectionID]
-		seen := make(map[uint32]bool)
-		for _, storyID := range uniqueSymbols(ionFieldValue(section, 141), 176) {
-			builder.indexStory(storyID, index+1, seen)
-		}
+		builder.indexContent(ionFieldValue(section, 141), index+1, make(map[uint32]bool), make(map[uint32]bool))
 	}
 }
 
-func (builder *epubBuilder) indexStory(storyID uint32, section int, seen map[uint32]bool) {
-	if seen[storyID] {
+func (builder *epubBuilder) indexContent(value *ionValue, section int, seenStories, seenTemplates map[uint32]bool) {
+	if value == nil {
 		return
 	}
-	seen[storyID] = true
-	story := builder.book.storylines[storyID]
-	var visit func(*ionValue)
-	visit = func(value *ionValue) {
-		if value == nil {
-			return
+	if value.kind == ionSymbol {
+		id := value.unsigned
+		if id <= uint64(^uint32(0)) && !seenTemplates[uint32(id)] {
+			if template := builder.book.templates[uint32(id)]; template != nil {
+				seenTemplates[uint32(id)] = true
+				builder.indexContent(template, section, seenStories, seenTemplates)
+			}
 		}
-		if value.kind == ionStruct {
-			if id, ok := ionID(ionFieldValue(value, 155)); ok && id <= uint64(^uint32(0)) {
-				builder.nodeSections[uint32(id)] = section
-				builder.sectionNodeCount[section]++
-				builder.nodePositions[uint32(id)] = builder.sectionNodeCount[section]
-				if text, err := builder.book.nodeText(value); err == nil {
-					builder.nodeTextRunes[uint32(id)] = len([]rune(text))
-				}
-			}
-			// KFX content branches are mutually exclusive and ordered: direct
-			// text, child content, then a named storyline. Index exactly the
-			// branch the renderer uses, otherwise anchors can be assigned to a
-			// section where their target is never emitted.
-			if ionFieldValue(value, 145) != nil {
-				return
-			}
-			if children := ionFieldValue(value, 146); children != nil {
-				visit(children)
-				return
-			}
-			if nested, ok := ionSymbolID(ionFieldValue(value, 176)); ok && nested <= uint64(^uint32(0)) && uint32(nested) != storyID {
-				builder.indexStory(uint32(nested), section, seen)
-			}
-			return
-		}
-		for _, child := range value.children {
-			visit(child)
-		}
+		return
 	}
-	visit(ionFieldValue(story, 146))
+	if value.kind == ionStruct {
+		if id, ok := ionID(ionFieldValue(value, 155)); ok && id <= uint64(^uint32(0)) {
+			builder.nodeSections[uint32(id)] = section
+			builder.sectionNodeCount[section]++
+			builder.nodePositions[uint32(id)] = builder.sectionNodeCount[section]
+			if text, err := builder.book.nodeText(value); err == nil {
+				builder.nodeTextRunes[uint32(id)] = len([]rune(text))
+			}
+		}
+		// Mirror renderValues branch precedence so navigation never points at
+		// content that the generated section omits.
+		if ionFieldValue(value, 145) != nil {
+			return
+		}
+		if children := ionFieldValue(value, 146); children != nil {
+			builder.indexContent(children, section, seenStories, seenTemplates)
+			return
+		}
+		if nested, ok := ionSymbolID(ionFieldValue(value, 176)); ok && nested <= uint64(^uint32(0)) {
+			storyID := uint32(nested)
+			if !seenStories[storyID] {
+				seenStories[storyID] = true
+				builder.indexContent(ionFieldValue(builder.book.storylines[storyID], 146), section, seenStories, seenTemplates)
+			}
+		}
+		return
+	}
+	for _, child := range value.children {
+		builder.indexContent(child, section, seenStories, seenTemplates)
+	}
 }
 
 func (builder *epubBuilder) nodeAttributes(node *ionValue) string {
@@ -106,14 +107,24 @@ func (builder *epubBuilder) nodeAttributes(node *ionValue) string {
 			attributes.WriteByte('"')
 		}
 	}
-	if span, ok := ionInteger(ionFieldValue(node, 148)); ok && span > 1 {
+	colspan, colspanOK := ionInteger(ionFieldValue(node, 148))
+	rowspan, rowspanOK := ionInteger(ionFieldValue(node, 149))
+	if styleID, ok := ionSymbolID(ionFieldValue(node, 157)); ok && styleID <= uint64(^uint32(0)) {
+		if !colspanOK {
+			colspan, colspanOK = builder.book.styleIntegerProperty(uint32(styleID), 148, make(map[uint32]bool))
+		}
+		if !rowspanOK {
+			rowspan, rowspanOK = builder.book.styleIntegerProperty(uint32(styleID), 149, make(map[uint32]bool))
+		}
+	}
+	if colspanOK && colspan > 1 {
 		attributes.WriteString(` colspan="`)
-		attributes.WriteString(strconv.FormatInt(span, 10))
+		attributes.WriteString(strconv.FormatInt(colspan, 10))
 		attributes.WriteByte('"')
 	}
-	if span, ok := ionInteger(ionFieldValue(node, 149)); ok && span > 1 {
+	if rowspanOK && rowspan > 1 {
 		attributes.WriteString(` rowspan="`)
-		attributes.WriteString(strconv.FormatInt(span, 10))
+		attributes.WriteString(strconv.FormatInt(rowspan, 10))
 		attributes.WriteByte('"')
 	}
 	for _, annotation := range ionListValues(ionFieldValue(node, 683)) {
@@ -137,27 +148,44 @@ func (builder *epubBuilder) nodeAttributes(node *ionValue) string {
 
 func directNodeStyle(node *ionValue) string {
 	kind, _ := ionSymbolID(ionFieldValue(node, 159))
-	if kind != 278 {
-		return ""
-	}
 	var properties []string
-	if collapse, ok := ionBoolean(ionFieldValue(node, 150)); ok {
-		if collapse {
-			properties = append(properties, "border-collapse:collapse")
-		} else {
-			properties = append(properties, "border-collapse:separate")
+	if kind == 278 {
+		if collapse, ok := ionBoolean(ionFieldValue(node, 150)); ok {
+			if collapse {
+				properties = append(properties, "border-collapse:collapse")
+			} else {
+				properties = append(properties, "border-collapse:separate")
+			}
+		}
+		horizontal, horizontalOK := cssDimension(ionFieldValue(node, 457))
+		vertical, verticalOK := cssDimension(ionFieldValue(node, 456))
+		if horizontalOK || verticalOK {
+			if !horizontalOK {
+				horizontal = "0"
+			}
+			if !verticalOK {
+				vertical = "0"
+			}
+			properties = append(properties, "border-spacing:"+horizontal+" "+vertical)
 		}
 	}
-	horizontal, horizontalOK := cssDimension(ionFieldValue(node, 457))
-	vertical, verticalOK := cssDimension(ionFieldValue(node, 456))
-	if horizontalOK || verticalOK {
-		if !horizontalOK {
-			horizontal = "0"
+	if fitWidth, ok := ionBoolean(ionFieldValue(node, 478)); ok && fitWidth {
+		switch kind {
+		case 278:
+			properties = append(properties, "display:inline-table")
+		case 270, 276:
+			properties = append(properties, "display:inline-block")
 		}
-		if !verticalOK {
-			vertical = "0"
+	}
+	if value, ok := ionSymbolID(ionFieldValue(node, 140)); ok {
+		switch value {
+		case 59:
+			properties = append(properties, "float:left")
+		case 61:
+			properties = append(properties, "float:right")
+		case 320:
+			properties = append(properties, "margin-left:auto", "margin-right:auto")
 		}
-		properties = append(properties, "border-spacing:"+horizontal+" "+vertical)
 	}
 	return strings.Join(properties, ";")
 }
@@ -200,7 +228,7 @@ func (builder *epubBuilder) renderStyledText(node *ionValue, text string) (strin
 	if ((eventsValue == nil || eventsValue.kind != ionList) && len(anchorIDs) == 0) || len(runes) == 0 {
 		content := escapeText(text)
 		if href := builder.linkTarget(ionFieldValue(node, 179)); href != "" {
-			return `<a href="` + escapeXML(href) + `">` + content + `</a>`, nil
+			return `<a` + noteReferenceAttribute(node) + ` href="` + escapeXML(href) + `">` + content + `</a>`, nil
 		}
 		return content, nil
 	}
@@ -227,6 +255,10 @@ func (builder *epubBuilder) renderStyledText(node *ionValue, text string) (strin
 		event := inlineStyleEvent{
 			start: int(offset), end: int(end), class: class,
 			href: builder.linkTarget(ionFieldValue(item, 179)),
+			note: func() bool {
+				typeID, ok := ionSymbolID(ionFieldValue(item, 616))
+				return ok && typeID == 617
+			}(),
 		}
 		if ionFieldValue(item, 757) != nil {
 			ruby, err := builder.rubySegments(item, event.start, event.end)
@@ -261,12 +293,20 @@ func (builder *epubBuilder) renderStyledText(node *ionValue, text string) (strin
 	}
 	output.WriteString(renderInlineRange(runes, cursor, len(runes), events, anchorIDs))
 	for _, anchorID := range anchorIDs[len(runes)] {
-		fmt.Fprintf(&output, `<span id="kfx-anchor-%d"></span>`, anchorID)
+		fmt.Fprintf(&output, `<span id="%s"></span>`, escapeXML(anchorID))
 	}
 	return output.String(), nil
 }
 
-func renderInlineRange(runes []rune, rangeStart, rangeEnd int, events []inlineStyleEvent, anchorIDs map[int][]uint32) string {
+func noteReferenceAttribute(value *ionValue) string {
+	typeID, ok := ionSymbolID(ionFieldValue(value, 616))
+	if ok && typeID == 617 {
+		return ` epub:type="noteref"`
+	}
+	return ""
+}
+
+func renderInlineRange(runes []rune, rangeStart, rangeEnd int, events []inlineStyleEvent, anchorIDs map[int][]string) string {
 	if rangeStart >= rangeEnd {
 		return ""
 	}
@@ -290,7 +330,7 @@ func renderInlineRange(runes []rune, rangeStart, rangeEnd int, events []inlineSt
 	for index := 0; index+1 < len(boundaries); index++ {
 		start, end := boundaries[index], boundaries[index+1]
 		for _, anchorID := range anchorIDs[start] {
-			fmt.Fprintf(&output, `<span id="kfx-anchor-%d"></span>`, anchorID)
+			fmt.Fprintf(&output, `<span id="%s"></span>`, escapeXML(anchorID))
 		}
 		fragment := escapeText(string(runes[start:end]))
 		var active []inlineStyleEvent
@@ -312,7 +352,11 @@ func renderInlineRange(runes []rune, rangeStart, rangeEnd int, events []inlineSt
 				fragment = `<span class="` + event.class + `">` + fragment + `</span>`
 			}
 			if event.href != "" && !linkUsed {
-				fragment = `<a href="` + escapeXML(event.href) + `">` + fragment + `</a>`
+				typeAttribute := ""
+				if event.note {
+					typeAttribute = ` epub:type="noteref"`
+				}
+				fragment = `<a` + typeAttribute + ` href="` + escapeXML(event.href) + `">` + fragment + `</a>`
 				linkUsed = true
 			}
 		}
@@ -421,19 +465,24 @@ func (builder *epubBuilder) collectAnnotationText(value *ionValue, seen map[*ion
 	return output.String()
 }
 
-func (builder *epubBuilder) inlineTextAnchors(node *ionValue, textLength int) map[int][]uint32 {
+func (builder *epubBuilder) inlineTextAnchors(node *ionValue, textLength int) map[int][]string {
 	nodeID, ok := ionID(ionFieldValue(node, 155))
 	if !ok || nodeID > uint64(^uint32(0)) || builder.book == nil {
 		return nil
 	}
-	result := make(map[int][]uint32)
+	result := make(map[int][]string)
 	for anchorID, item := range builder.book.anchors {
 		if !item.targetSymbol && item.targetNode == uint32(nodeID) && item.offset > 0 && item.offset <= textLength {
-			result[item.offset] = append(result[item.offset], anchorID)
+			result[item.offset] = append(result[item.offset], fmt.Sprintf("kfx-anchor-%d", anchorID))
+		}
+	}
+	for offset, ids := range builder.positionAnchors[uint32(nodeID)] {
+		if offset > 0 && offset <= textLength {
+			result[offset] = append(result[offset], ids...)
 		}
 	}
 	for offset := range result {
-		sort.Slice(result[offset], func(i, j int) bool { return result[offset][i] < result[offset][j] })
+		sort.Strings(result[offset])
 	}
 	return result
 }
@@ -483,9 +532,14 @@ func (builder *epubBuilder) linkTarget(value *ionValue) string {
 }
 
 func (builder *epubBuilder) navigationItems() []epubNavigationItem {
+	return builder.navigationDocument().toc
+}
+
+func (builder *epubBuilder) navigationDocument() epubNavigationDocument {
+	var result epubNavigationDocument
 	root := builder.book.navigation
 	if root == nil || root.kind != ionList {
-		return nil
+		return result
 	}
 	for _, readingOrder := range root.children {
 		containers := ionFieldValue(readingOrder, 392)
@@ -494,16 +548,26 @@ func (builder *epubBuilder) navigationItems() []epubNavigationItem {
 		}
 		for _, container := range containers.children {
 			kind, ok := ionSymbolID(ionFieldValue(container, 235))
-			if !ok || kind != 212 {
+			if !ok {
 				continue
 			}
-			return builder.parseNavigationEntries(ionFieldValue(container, 247))
+			switch kind {
+			case 212:
+				if len(result.toc) == 0 {
+					result.toc = builder.parseNavigationEntries(ionFieldValue(container, 247), kind)
+				}
+			case 236:
+				result.landmarks = append(result.landmarks, builder.parseNavigationEntries(ionFieldValue(container, 247), kind)...)
+			case 237:
+				result.pages = append(result.pages, builder.parseNavigationEntries(ionFieldValue(container, 247), kind)...)
+			}
 		}
+		break
 	}
-	return nil
+	return result
 }
 
-func (builder *epubBuilder) parseNavigationEntries(value *ionValue) []epubNavigationItem {
+func (builder *epubBuilder) parseNavigationEntries(value *ionValue, kind uint64) []epubNavigationItem {
 	if value == nil || value.kind != ionList {
 		return nil
 	}
@@ -526,18 +590,52 @@ func (builder *epubBuilder) parseNavigationEntries(value *ionValue) []epubNaviga
 				positionInSection = builder.nodePositions[uint32(target)]
 			}
 		}
-		children := builder.parseNavigationEntries(ionFieldValue(entry, 247))
+		children := builder.parseNavigationEntries(ionFieldValue(entry, 247), kind)
+		epubType := ""
+		if kind == 236 {
+			landmark, _ := ionSymbolID(ionFieldValue(entry, 238))
+			epubType = map[uint64]string{233: "cover", 212: "toc", 396: "bodymatter", 269: "bodymatter"}[landmark]
+			if epubType == "" {
+				// EPUB 3 requires every link in a landmarks nav to carry a
+				// recognized semantic type. KFX also stores untyped guide
+				// entries; retaining those here would produce an invalid EPUB,
+				// and guessing a type can misrepresent the publication.
+				result = append(result, children...)
+				continue
+			}
+			if strings.TrimSpace(label) == "" {
+				label = map[string]string{
+					"cover": "Cover", "toc": "Table of Contents", "bodymatter": "Beginning",
+				}[epubType]
+			}
+		}
 		if strings.TrimSpace(label) == "" || section == 0 {
 			result = append(result, children...)
 			continue
 		}
 		href := fmt.Sprintf("text/section-%04d.xhtml", section)
 		if !targetsSection {
-			href += fmt.Sprintf("#kfx-node-%d", target)
+			offset, _ := ionInteger(ionFieldValue(position, 143))
+			if offset > 0 && offset <= int64(builder.nodeTextRunes[uint32(target)]) {
+				builder.nextPositionID++
+				anchorID := fmt.Sprintf("kfx-nav-%06d", builder.nextPositionID)
+				if builder.positionAnchors == nil {
+					builder.positionAnchors = make(map[uint32]map[int][]string)
+				}
+				if builder.positionAnchors[uint32(target)] == nil {
+					builder.positionAnchors[uint32(target)] = make(map[int][]string)
+				}
+				builder.positionAnchors[uint32(target)][int(offset)] = append(
+					builder.positionAnchors[uint32(target)][int(offset)], anchorID)
+				href += "#" + anchorID
+			} else {
+				href += fmt.Sprintf("#kfx-node-%d", target)
+			}
 		}
 		result = append(result, epubNavigationItem{
 			label:    shortNavigationTitle(label, 120),
 			href:     href,
+			epubType: epubType,
 			section:  section,
 			position: positionInSection,
 			children: children,
@@ -596,21 +694,58 @@ func (builder *epubBuilder) styleSheet() string {
 	for _, rawID := range ids {
 		id := uint32(rawID)
 		properties := builder.book.styleProperties(id, make(map[uint32]bool))
-		if len(properties) == 0 {
-			continue
+		if len(properties) != 0 {
+			names := make([]string, 0, len(properties))
+			for name := range properties {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			fmt.Fprintf(&css, ".kfx-s%d {", id)
+			for _, name := range names {
+				fmt.Fprintf(&css, "%s:%s;", name, properties[name])
+			}
+			css.WriteString("}\n")
 		}
-		names := make([]string, 0, len(properties))
-		for name := range properties {
-			names = append(names, name)
+		link, linkOK := builder.book.styleColorProperty(id, 577, make(map[uint32]bool))
+		visited, visitedOK := builder.book.styleColorProperty(id, 576, make(map[uint32]bool))
+		if linkOK {
+			fmt.Fprintf(&css, ".kfx-s%d:link,a:link .kfx-s%d {color:%s;}\n", id, id, link)
 		}
-		sort.Strings(names)
-		fmt.Fprintf(&css, ".kfx-s%d {", id)
-		for _, name := range names {
-			fmt.Fprintf(&css, "%s:%s;", name, properties[name])
+		if visitedOK {
+			fmt.Fprintf(&css, ".kfx-s%d:visited,a:visited .kfx-s%d {color:%s;}\n", id, id, visited)
 		}
-		css.WriteString("}\n")
 	}
 	return css.String()
+}
+
+func (book *decodedBook) styleColorProperty(id uint32, field uint64, seen map[uint32]bool) (string, bool) {
+	if seen[id] {
+		return "", false
+	}
+	seen[id] = true
+	style := book.styles[id]
+	if value, ok := nestedStyleColor(ionFieldValue(style, field)); ok {
+		return value, true
+	}
+	if parent, ok := ionSymbolID(ionFieldValue(style, 158)); ok && parent <= uint64(^uint32(0)) {
+		return book.styleColorProperty(uint32(parent), field, seen)
+	}
+	return "", false
+}
+
+func (book *decodedBook) styleIntegerProperty(id uint32, field uint64, seen map[uint32]bool) (int64, bool) {
+	if seen[id] {
+		return 0, false
+	}
+	seen[id] = true
+	style := book.styles[id]
+	if value, ok := ionInteger(ionFieldValue(style, field)); ok {
+		return value, true
+	}
+	if parent, ok := ionSymbolID(ionFieldValue(style, 158)); ok && parent <= uint64(^uint32(0)) {
+		return book.styleIntegerProperty(uint32(parent), field, seen)
+	}
+	return 0, false
 }
 
 func (book *decodedBook) styleProperties(id uint32, stack map[uint32]bool) map[string]string {
@@ -673,7 +808,7 @@ func (book *decodedBook) styleProperties(id uint32, stack map[uint32]bool) map[s
 		}
 	}
 	if value, ok := ionSymbolID(ionFieldValue(style, 41)); ok {
-		if mapped := map[uint64]string{350: "none", 372: "uppercase", 373: "lowercase", 374: "capitalize"}[value]; mapped != "" {
+		if mapped := map[uint64]string{349: "none", 372: "uppercase", 373: "lowercase", 374: "capitalize"}[value]; mapped != "" {
 			properties["text-transform"] = mapped
 		}
 	}

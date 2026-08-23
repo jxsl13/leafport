@@ -14,6 +14,7 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 func TestGroupPDFPages(t *testing.T) {
@@ -249,6 +250,101 @@ func TestPDFPageSelectionIsNotMistakenForExactCopyAndAddsMetadata(t *testing.T) 
 	}
 	if len(bookmarks) != 1 || bookmarks[0].Title != "First" || bookmarks[0].PageFrom != 1 {
 		t.Fatalf("written bookmarks = %+v", bookmarks)
+	}
+}
+
+func TestEmbeddedPDFNonfunctionalLinksAreRemovedSelectively(t *testing.T) {
+	imageData := testPNG(t, 2, 2, color.Black)
+	var source bytes.Buffer
+	if err := api.ImportImages(nil, &source, []io.Reader{bytes.NewReader(imageData)}, nil, pdfConfiguration()); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	plainPath := filepath.Join(directory, "plain.pdf")
+	validPath := filepath.Join(directory, "valid.pdf")
+	brokenPath := filepath.Join(directory, "broken.pdf")
+	if err := os.WriteFile(plainPath, source.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	brokenCandidate := model.NewLinkAnnotation(
+		*types.NewRectangle(0, 0, 1, 1), 0, "", "broken", "", 0, nil,
+		nil, "https://example.com", nil, false, 0, model.BSSolid,
+	)
+	validLink := model.NewLinkAnnotation(
+		*types.NewRectangle(1, 1, 2, 2), 0, "", "valid", "", 0, nil,
+		nil, "https://example.org", nil, false, 0, model.BSSolid,
+	)
+	if err := api.AddAnnotationsMapFile(plainPath, validPath, map[int][]model.AnnotationRenderer{
+		1: {brokenCandidate, validLink},
+	}, pdfConfiguration(), false); err != nil {
+		t.Fatal(err)
+	}
+	valid, err := os.Open(validPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context, err := api.ReadValidateAndOptimize(valid, pdfConfiguration())
+	if closeErr := valid.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _, _, err := context.PageDict(1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawAnnotations, err := context.DereferenceArray(page["Annots"])
+	if err != nil || len(rawAnnotations) != 2 {
+		t.Fatalf("annotations = %v, err = %v", rawAnnotations, err)
+	}
+	changed := false
+	for _, rawAnnotation := range rawAnnotations {
+		annotation, err := context.DereferenceDict(rawAnnotation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id := annotation.StringEntry("NM"); id != nil && *id == "broken" {
+			annotation["A"] = types.Dict{"S": types.Name("GoTo")}
+			changed = true
+		}
+	}
+	if !changed {
+		t.Fatal("did not locate the broken-link test annotation")
+	}
+	if err := api.WriteContextFile(context, brokenPath); err != nil {
+		t.Fatal(err)
+	}
+	brokenData, err := os.ReadFile(brokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(directory, "clean.pdf")
+	result, err := convertFixedLayoutPagesToPDF(nil, []Page{{
+		ResourceID: 1, Format: kfxPDFFormat, Location: "broken.pdf", PageIndex: 0, Data: brokenData,
+	}}, destination, Metadata{Title: "Clean sample"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BrokenLinksRemoved != 1 || result.ExactCopy {
+		t.Fatalf("result = %+v", result)
+	}
+	file, err := os.Open(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	finalAnnotations, err := api.Annotations(file, nil, pdfConfiguration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finalAnnotations[1][model.AnnLink].Map) != 1 {
+		t.Fatalf("link annotations = %+v", finalAnnotations[1][model.AnnLink].Map)
+	}
+	for _, annotation := range finalAnnotations[1][model.AnnLink].Map {
+		if annotation.ID() != "valid" || annotation.ContentString() != "https://example.org" {
+			t.Fatalf("retained link = id %q, content %q", annotation.ID(), annotation.ContentString())
+		}
 	}
 }
 

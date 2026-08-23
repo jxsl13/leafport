@@ -68,7 +68,7 @@ func Export(ctx context.Context, config Config, output library.Output, workRoot 
 	if err != nil {
 		return result, err
 	}
-	bridge, err := prepareCatalystSelf(config.AppPath, temporary)
+	bridge, err := prepareCatalystSelf(config.AppPath, temporary, false)
 	if err != nil {
 		return result, err
 	}
@@ -345,7 +345,7 @@ func Doctor(ctx context.Context, config Config) (report runtimebridge.DoctorRepo
 	if err != nil {
 		return report, err
 	}
-	bridge, err := prepareCatalystSelf(config.AppPath, temporary)
+	bridge, err := prepareCatalystSelf(config.AppPath, temporary, false)
 	if err != nil {
 		return report, err
 	}
@@ -355,9 +355,43 @@ func Doctor(ctx context.Context, config Config) (report runtimebridge.DoctorRepo
 	if err := prepareReaderHome(temporary, config.Preferences); err != nil {
 		return report, err
 	}
+	report, err = runDoctorBridge(ctx, config, bridge, runtimeDylib, temporary)
+	if err != nil {
+		return report, err
+	}
+	// A copied restricted keychain access group cannot be trusted merely
+	// because it is present in an ad-hoc signature. Probe it in a second,
+	// disposable process and preserve only success/failure—not the credential.
+	// macOS commonly terminates this process during signature validation.
+	if !report.AccountSecretAvailable && config.Preferences != "" {
+		report.EntitlementProbeAttempted = true
+		entitledRoot := filepath.Join(temporary, "entitlement-probe")
+		entitledBridge, prepareErr := prepareCatalystSelf(config.AppPath, entitledRoot, true)
+		if prepareErr != nil {
+			report.EntitlementProbeError = prepareErr.Error()
+		} else {
+			entitledReport, probeErr := runDoctorBridge(ctx, config, entitledBridge, runtimeDylib, temporary)
+			if probeErr != nil {
+				report.EntitlementProbeError = probeErr.Error()
+			} else if entitledReport.AccountSecretAvailable {
+				report.AccountSecretAvailable = true
+				report.AccountSecretProbeError = ""
+			} else {
+				report.EntitlementProbeError = entitledReport.AccountSecretProbeError
+				if report.EntitlementProbeError == "" {
+					report.EntitlementProbeError = "reader-entitled bridge returned no usable raw account secret"
+				}
+			}
+		}
+	}
+	return report, nil
+}
+
+func runDoctorBridge(ctx context.Context, config Config, bridge, runtimeDylib, home string) (runtimebridge.DoctorReport, error) {
+	var report runtimebridge.DoctorReport
 	command := exec.CommandContext(ctx, bridge, DoctorRuntimeCommand, runtimeDylib, config.Preferences)
-	command.Dir = temporary
-	command.Env = replaceEnvironment(removeEnvironment(os.Environ(), "LEAFPORT_ACCOUNT_SECRET"), "CFFIXED_USER_HOME", temporary)
+	command.Dir = home
+	command.Env = replaceEnvironment(removeEnvironment(os.Environ(), "LEAFPORT_ACCOUNT_SECRET"), "CFFIXED_USER_HOME", home)
 	command.Stdin = config.Stdin
 	var output bytes.Buffer
 	var runtimeStderr bytes.Buffer
@@ -458,7 +492,7 @@ func prepareRuntime(appPath, temporary string) (string, error) {
 	return runtimeDylib, nil
 }
 
-func prepareCatalystSelf(appPath, temporary string) (string, error) {
+func prepareCatalystSelf(appPath, temporary string, readerEntitlements bool) (string, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -474,7 +508,24 @@ func prepareCatalystSelf(appPath, temporary string) (string, error) {
 	if err := machoutil.SetMacCatalystPlatform(data); err != nil {
 		return "", fmt.Errorf("prepare Go runtime bridge: %w", err)
 	}
-	data, err = machoutil.AdHocSign(data, "LeafportBridge")
+	identifier := "LeafportBridge"
+	var entitlements []byte
+	if readerEntitlements {
+		reader, readErr := os.ReadFile(filepath.Join(appPath, "Contents", "MacOS", "Kindle"))
+		if readErr != nil {
+			return "", fmt.Errorf("read reader entitlements: %w", readErr)
+		}
+		reader, readErr = machoutil.ThinARM64(reader)
+		if readErr != nil {
+			return "", fmt.Errorf("select reader entitlements: %w", readErr)
+		}
+		entitlements, readErr = machoutil.EmbeddedEntitlements(reader)
+		if readErr != nil {
+			return "", fmt.Errorf("extract reader entitlements: %w", readErr)
+		}
+		identifier = "com.amazon.Lassen"
+	}
+	data, err = machoutil.AdHocSignWithEntitlements(data, identifier, entitlements)
 	if err != nil {
 		return "", fmt.Errorf("sign Go runtime bridge: %w", err)
 	}

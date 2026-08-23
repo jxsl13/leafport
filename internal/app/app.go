@@ -168,7 +168,7 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		}
 	}()
 	var failures []error
-	accountSecretBlocks := preflightAccountSecrets(ctx, config, streams, outputs)
+	accountSecrets := preflightAccountSecrets(ctx, config, streams, outputs)
 	for index, output := range outputs {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			failures = append(failures, ctxErr)
@@ -214,7 +214,7 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 			failures = append(failures, fmt.Errorf("inspect intermediate archive for %s: %w", output.Book.ID, archiveErr))
 			continue
 		default:
-			if block := accountSecretBlocks[output.Book.ID]; block != nil {
+			if block := accountSecrets.blocked[output.Book.ID]; block != nil {
 				failure := fmt.Errorf("%s (%s): %w",
 					library.DisplayTitle(output.Book), output.Book.ID, block)
 				failures = append(failures, failure)
@@ -231,8 +231,12 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 			}
 			fmt.Fprintf(streams.Stdout, "[%d/%d] Decrypting %s — %s\n",
 				index+1, len(outputs), output.Book.ID, library.DisplayTitle(output.Book))
+			accountSecret := config.AccountSecret
+			if accountSecret == "" {
+				accountSecret = accountSecrets.byPreferences[output.Book.Preferences]
+			}
 			exportConfig := exporter.Config{
-				AppPath: config.AppPath, AccountSecret: config.AccountSecret,
+				AppPath: config.AppPath, AccountSecret: accountSecret,
 				Stdin: streams.Stdin, Stdout: streams.Stdout, Stderr: streams.Stderr,
 			}
 			archive, exportErr := exporter.Export(ctx, exportConfig, output, workRoot)
@@ -292,6 +296,10 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		case "PDF":
 			fmt.Fprintf(streams.Stdout, "[%d/%d] Completed PDF: %s (%d pages)\n",
 				index+1, len(outputs), conversion.Path, conversion.Pages)
+			if conversion.BrokenLinksRemoved != 0 {
+				fmt.Fprintf(streams.Stdout, "[%d/%d] Removed %d nonfunctional link annotation(s) inherited from embedded PDF resources\n",
+					index+1, len(outputs), conversion.BrokenLinksRemoved)
+			}
 		case "EPUB":
 			fmt.Fprintf(streams.Stdout, "[%d/%d] Completed EPUB: %s (%d sections, %d images, %d media, %d fonts)\n",
 				index+1, len(outputs), conversion.Path, conversion.Sections, conversion.Images, conversion.Media, conversion.Fonts)
@@ -317,10 +325,18 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 	return nil
 }
 
-func preflightAccountSecrets(ctx context.Context, config Config, streams Streams, outputs []library.Output) map[string]error {
-	blocked := make(map[string]error)
+type accountSecretPreflight struct {
+	blocked       map[string]error
+	byPreferences map[string]string
+}
+
+func preflightAccountSecrets(ctx context.Context, config Config, streams Streams, outputs []library.Output) accountSecretPreflight {
+	result := accountSecretPreflight{
+		blocked:       make(map[string]error),
+		byPreferences: make(map[string]string),
+	}
 	if config.AccountSecret != "" {
-		return blocked
+		return result
 	}
 	groups := make(map[string][]library.Book)
 	for _, output := range outputs {
@@ -336,25 +352,58 @@ func preflightAccountSecrets(ctx context.Context, config Config, streams Streams
 			groups[book.Preferences] = append(groups[book.Preferences], book)
 		}
 	}
+	type discoveryResult struct {
+		secret string
+		report readerconfig.AccountSecretDiscovery
+		err    error
+	}
+	discoveries := make(map[string]discoveryResult)
+	home, homeErr := os.UserHomeDir()
 	for preferences, group := range groups {
 		if err := ctx.Err(); err != nil {
 			break
 		}
 		credentials, err := readerconfig.LoadCredentials(preferences)
+		var discovery discoveryResult
+		if err == nil && credentials.HashedAccountSecret != "" {
+			var found bool
+			discovery, found = discoveries[credentials.HashedAccountSecret]
+			if !found {
+				if homeErr != nil {
+					discovery.err = homeErr
+				} else {
+					discovery.secret, discovery.report, discovery.err = readerconfig.DiscoverAccountSecret(
+						credentials.HashedAccountSecret, readerconfig.DefaultAccountSecretRoots(home))
+				}
+				discoveries[credentials.HashedAccountSecret] = discovery
+			}
+			if discovery.err == nil && discovery.secret != "" {
+				result.byPreferences[preferences] = discovery.secret
+				fmt.Fprintf(streams.Stdout,
+					"Account-secret preflight: verified a reader-owned credential against its stored fingerprint (%d file(s), %d candidate(s)).\n",
+					discovery.report.Files, discovery.report.Candidates)
+				continue
+			}
+		}
 		detail := "voucher requires the raw 40-character account secret; automatic retrieval is unavailable because the signed reader's Data Protection Keychain access group cannot be inherited by Leafport"
 		if err != nil {
 			detail += "; reader registration: " + err.Error()
 		}
 		if credentials.HashedAccountSecret != "" {
 			detail += "; preferences contain only the incompatible hash"
+			if discovery.err != nil {
+				detail += "; reader-owned storage scan failed: " + discovery.err.Error()
+			} else {
+				detail += fmt.Sprintf("; no matching raw value in %d normally readable file(s)", discovery.report.Files)
+			}
 		}
 		detail += "; LEAFPORT_ACCOUNT_SECRET is usable only if the raw value was obtained independently"
 		for _, book := range group {
-			blocked[book.ID] = errors.New(detail)
+			result.blocked[book.ID] = errors.New(detail)
 		}
 		fmt.Fprintf(streams.Stderr, "Account-secret preflight: %d selected book(s) require a credential unavailable to this process.\n", len(group))
 	}
-	return blocked
+	return result
 }
 
 func existingPublication(base string) (string, error) {

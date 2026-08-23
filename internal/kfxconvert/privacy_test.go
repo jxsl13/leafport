@@ -29,7 +29,7 @@ func TestValidatePrivacyOptions(t *testing.T) {
 }
 
 func TestRedactTextCleansExternalTitles(t *testing.T) {
-	output, err := RedactText("Jane Doe — jane@example.com", PrivacyOptions{
+	output, err := RedactText("Licensed to Jane Doe — jane@example.com", PrivacyOptions{
 		DetectPersonal: true,
 		Patterns:       []string{"Jane Doe"},
 	})
@@ -73,6 +73,35 @@ func TestPrivacyDetectsOwnerMetadataAndRedactsText(t *testing.T) {
 	}
 	if book.anchors[1].externalURL != "" {
 		t.Fatalf("personal link was retained: %q", book.anchors[1].externalURL)
+	}
+}
+
+func TestPrivacyDoesNotTreatPublicationContactAsOwner(t *testing.T) {
+	description := &ionValue{kind: ionString, text: "Questions: publisher@example.com"}
+	book := &decodedBook{
+		contents: map[uint32][]string{1: {"Contact publisher@example.com for updates."}},
+		metadata: map[string]map[string][]string{
+			"kindle_title_metadata": {
+				"author":      {"Jane Doe"},
+				"description": {description.text},
+			},
+		},
+		metadataRaw: map[string]map[string][]*ionValue{
+			"kindle_title_metadata": {"description": {description}},
+		},
+		anchors: map[uint32]anchor{1: {externalURL: "mailto:publisher@example.com"}},
+	}
+	report, err := applyPrivacy(book, PrivacyOptions{DetectPersonal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.AutomaticValues != 0 || report.MetadataFields != 0 {
+		t.Fatalf("ordinary publication contact was classified as personal: %+v", report)
+	}
+	for _, value := range []string{book.contents[1][0], description.text, book.anchors[1].externalURL} {
+		if !strings.Contains(value, "publisher@example.com") {
+			t.Fatalf("publication contact was redacted: %q", value)
+		}
 	}
 }
 

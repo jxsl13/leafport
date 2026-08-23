@@ -307,18 +307,51 @@ func validateKFXPDFLinks(path string, expected int) error {
 	if err != nil {
 		return err
 	}
-	annotations, readErr := api.Annotations(file, nil, pdfConfiguration())
-	closeErr := file.Close()
-	if readErr != nil || closeErr != nil {
-		return fmt.Errorf("validate PDF links: %w", errors.Join(readErr, closeErr))
+	context, readErr := api.ReadAndValidate(file, pdfConfiguration())
+	if readErr != nil {
+		_ = file.Close()
+		return fmt.Errorf("validate PDF links: %w", readErr)
 	}
 	count := 0
-	for _, page := range annotations {
-		for _, annotation := range page[model.AnnLink].Map {
-			if strings.HasPrefix(annotation.ID(), "leafport-link-") {
-				count++
-			}
+	ids := make(map[string]bool)
+	for pageNumber := 1; pageNumber <= context.PageCount; pageNumber++ {
+		page, _, _, pageErr := context.PageDict(pageNumber, false)
+		if pageErr != nil {
+			_ = file.Close()
+			return fmt.Errorf("validate PDF links on page %d: %w", pageNumber, pageErr)
 		}
+		annotations, annotationErr := context.DereferenceArray(page["Annots"])
+		if annotationErr != nil {
+			_ = file.Close()
+			return fmt.Errorf("validate PDF links on page %d: %w", pageNumber, annotationErr)
+		}
+		for _, annotationObject := range annotations {
+			annotation, dereferenceErr := context.DereferenceDict(annotationObject)
+			if dereferenceErr != nil {
+				_ = file.Close()
+				return fmt.Errorf("validate PDF link on page %d: %w", pageNumber, dereferenceErr)
+			}
+			if annotation == nil || annotation.NameEntry("Subtype") == nil || *annotation.NameEntry("Subtype") != "Link" {
+				continue
+			}
+			id := annotation.StringEntry("NM")
+			if id == nil || !strings.HasPrefix(*id, "leafport-link-") {
+				continue
+			}
+			if ids[*id] {
+				_ = file.Close()
+				return fmt.Errorf("validate PDF links: duplicate annotation ID %q", *id)
+			}
+			ids[*id] = true
+			if brokenPDFLink(context, annotation) {
+				_ = file.Close()
+				return fmt.Errorf("validate PDF links: annotation %q on page %d has an unresolved destination", *id, pageNumber)
+			}
+			count++
+		}
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		return fmt.Errorf("validate PDF links: %w", closeErr)
 	}
 	if count != expected {
 		return fmt.Errorf("validate PDF links: found %d Leafport links; expected %d", count, expected)

@@ -31,8 +31,16 @@ func sanitizePDFBytes(data []byte) ([]byte, error) {
 	if _, err := pdfcpu.RemoveAnnotations(context, nil, nil, nil, false); err != nil {
 		return nil, fmt.Errorf("remove PDF annotations: %w", err)
 	}
-	if _, err := context.RemoveAttachments(nil); err != nil {
-		return nil, fmt.Errorf("remove PDF attachments: %w", err)
+	names, err := context.DereferenceDict(root["Names"])
+	if err != nil {
+		return nil, fmt.Errorf("read PDF name tree: %w", err)
+	}
+	if names != nil {
+		if _, present := names["EmbeddedFiles"]; present {
+			if _, err := context.RemoveAttachments(nil); err != nil {
+				return nil, fmt.Errorf("remove PDF attachments: %w", err)
+			}
+		}
 	}
 	if err := removePDFMetadataObjects(context); err != nil {
 		return nil, err
@@ -49,9 +57,7 @@ func sanitizePDFBytes(data []byte) ([]byte, error) {
 	for _, key := range []string{"OpenAction", "AA", "Perms", "PieceInfo"} {
 		delete(root, key)
 	}
-	if names, err := context.DereferenceDict(root["Names"]); err != nil {
-		return nil, fmt.Errorf("read PDF name tree: %w", err)
-	} else if names != nil {
+	if names != nil {
 		delete(names, "JavaScript")
 		delete(names, "EmbeddedFiles")
 	}
@@ -150,15 +156,16 @@ func verifySanitizedPDF(data []byte) error {
 	if info.Title != "" || info.Author != "" || info.Subject != "" || info.Creator != "" || len(info.Keywords) != 0 {
 		return fmt.Errorf("metadata-free PDF still contains standard document information")
 	}
-	metadata := 0
-	if err := api.ExtractMetadata(bytes.NewReader(data), func(pdfcpu.Metadata) error {
-		metadata++
-		return nil
-	}, pdfConfiguration()); err != nil {
+	context, err := api.ReadValidateAndOptimize(bytes.NewReader(data), pdfConfiguration())
+	if err != nil {
 		return fmt.Errorf("verify PDF metadata streams: %w", err)
 	}
-	if metadata != 0 {
-		return fmt.Errorf("metadata-free PDF still contains %d metadata streams", metadata)
+	metadata, err := pdfcpu.ExtractMetadata(context)
+	if err != nil {
+		return fmt.Errorf("verify PDF metadata streams: %w", err)
+	}
+	if len(metadata) != 0 {
+		return fmt.Errorf("metadata-free PDF still contains %d metadata streams", len(metadata))
 	}
 	return nil
 }

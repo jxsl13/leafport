@@ -46,15 +46,16 @@ func ValidatePrivacyOptions(options PrivacyOptions) error {
 	return nil
 }
 
-// RedactText applies explicit patterns and automatic email detection to text
-// that lives outside the KFX container, such as a library title used for an
-// output file name.
+// RedactText applies explicit patterns and contextual automatic email
+// detection to text that lives outside the KFX container, such as a library
+// title used for an output file name. A bare email is not assumed to identify
+// the owner because it can legitimately belong to an author or publisher.
 func RedactText(value string, options PrivacyOptions) (string, error) {
 	if err := ValidatePrivacyOptions(options); err != nil {
 		return "", err
 	}
 	patterns := append([]string(nil), options.Patterns...)
-	if options.DetectPersonal {
+	if options.DetectPersonal && hasPersonalContext(value) {
 		seen := make(map[string]struct{})
 		for _, email := range metadataEmailPattern.FindAllString(value, -1) {
 			if _, exists := seen[strings.ToLower(email)]; exists {
@@ -91,8 +92,10 @@ func applyPrivacy(book *decodedBook, options PrivacyOptions) (PrivacyResult, err
 			for key, values := range entries {
 				personalField := personalMetadataField(category, key)
 				for _, value := range values {
-					for _, email := range metadataEmailPattern.FindAllString(value, -1) {
-						addAutomaticValue(automatic, email)
+					if personalField || hasPersonalContext(value) {
+						for _, email := range metadataEmailPattern.FindAllString(value, -1) {
+							addAutomaticValue(automatic, email)
+						}
 					}
 					if personalField {
 						addAutomaticValue(automatic, value)
@@ -157,6 +160,22 @@ func addAutomaticValue(values map[string]struct{}, value string) {
 		return
 	}
 	values[value] = struct{}{}
+}
+
+func hasPersonalContext(value string) bool {
+	value = strings.ToLower(value)
+	for _, phrase := range []string{
+		"licensed to", "licensed for", "registered to", "delivered to",
+		"personalized for", "personalised for", "prepared for",
+		"purchased by", "bought by",
+		"lizenziert für", "registriert auf", "bereitgestellt für",
+		"personalisiert für", "gekauft von",
+	} {
+		if strings.Contains(value, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func personalMetadataField(category, key string) bool {

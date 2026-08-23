@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestTextTransformMatchesKFXSemantics(t *testing.T) {
+	for symbol, want := range map[uint64]string{
+		349: "none", 372: "uppercase", 373: "lowercase", 374: "capitalize",
+	} {
+		book := decodedBook{styles: map[uint32]*ionValue{
+			1: testStruct(testField(41, testSymbol(symbol))),
+		}}
+		if got := book.styleProperties(1, make(map[uint32]bool))["text-transform"]; got != want {
+			t.Errorf("text-transform $%d = %q, want %q", symbol, got, want)
+		}
+	}
+	if !supportedEPUBStyleField(41) {
+		t.Fatal("KFX text-transform field $41 is not accepted")
+	}
+}
+
 func TestRenderStyledTextPreservesExternalLinkAndStyle(t *testing.T) {
 	event := &ionValue{kind: ionStruct, fields: []ionField{
 		{id: 143, value: &ionValue{kind: ionInt, integer: 1, unsigned: 1}},
@@ -25,6 +41,42 @@ func TestRenderStyledTextPreservesExternalLinkAndStyle(t *testing.T) {
 	want := `h<a href="https://example.com/read"><span class="kfx-s900">ell</span></a>o`
 	if got != want {
 		t.Fatalf("styled text = %q, want %q", got, want)
+	}
+}
+
+func TestRenderStyledTextPreservesNoteSemantics(t *testing.T) {
+	event := testStruct(
+		testField(143, testInteger(1)), testField(144, testInteger(3)),
+		testField(179, testSymbol(901)), testField(616, testSymbol(617)),
+	)
+	node := testStruct(testField(142, testList(event)))
+	builder := epubBuilder{book: &decodedBook{anchors: map[uint32]anchor{
+		901: {externalURL: "https://example.com/note"},
+	}}}
+	got, err := builder.renderStyledText(node, "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `h<a epub:type="noteref" href="https://example.com/note">ell</a>o` {
+		t.Fatalf("note reference = %q", got)
+	}
+
+	direct := testStruct(testField(179, testSymbol(901)), testField(616, testSymbol(617)))
+	got, err = builder.renderStyledText(direct, "note")
+	if err != nil || got != `<a epub:type="noteref" href="https://example.com/note">note</a>` {
+		t.Fatalf("direct note reference = %q, %v", got, err)
+	}
+}
+
+func TestRenderTextPreservesEndnoteClassification(t *testing.T) {
+	node := testStruct(
+		testField(159, testSymbol(269)), testField(145, testString("Endnote text")),
+		testField(615, testSymbol(619)),
+	)
+	builder := epubBuilder{book: &decodedBook{anchors: map[uint32]anchor{}}}
+	got, _, err := builder.renderValues(node, 1, map[uint32]bool{}, 0)
+	if err != nil || got != `<aside epub:type="endnote">Endnote text</aside>` {
+		t.Fatalf("endnote = %q, %v", got, err)
 	}
 }
 
@@ -280,6 +332,25 @@ func TestRenderTableTreatsKnownContainersAsCells(t *testing.T) {
 	}
 }
 
+func TestRenderTableResolvesInheritedCellSpan(t *testing.T) {
+	cell := testStruct(
+		testField(157, testSymbol(2)), testField(159, testSymbol(270)),
+		testField(146, testList(testStruct(testField(159, testSymbol(269)), testField(145, testString("value"))))),
+	)
+	row := testStruct(testField(159, testSymbol(279)), testField(146, testList(cell)))
+	book := &decodedBook{
+		styles: map[uint32]*ionValue{
+			1: testStruct(testField(149, testInteger(2))),
+			2: testStruct(testField(158, testSymbol(1))),
+		},
+		anchors: map[uint32]anchor{}, templates: map[uint32]*ionValue{},
+	}
+	got, _, err := (&epubBuilder{book: book}).renderValues(row, 1, map[uint32]bool{}, 0)
+	if err != nil || !strings.Contains(got, `<td class="kfx-s2" rowspan="2">`) {
+		t.Fatalf("spanning table cell = %q, %v", got, err)
+	}
+}
+
 func TestNavigationUsesRenderedReadingOrder(t *testing.T) {
 	entry := func(label string, target int64) *ionValue {
 		return testStruct(
@@ -296,9 +367,56 @@ func TestNavigationUsesRenderedReadingOrder(t *testing.T) {
 		entry("third section", 10),
 		entry("later in second", 20),
 		entry("earlier in second", 30),
-	))
+	), 212)
 	if len(items) != 3 || items[0].label != "earlier in second" || items[1].label != "later in second" || items[2].label != "third section" {
 		t.Fatalf("navigation order = %+v", items)
+	}
+}
+
+func TestNavigationPreservesLandmarksPagesAndOffsets(t *testing.T) {
+	entry := func(label string, target, offset int64, landmark uint64) *ionValue {
+		fields := []ionField{
+			testField(241, testStruct(testField(244, testString(label)))),
+			testField(246, testStruct(testField(143, testInteger(offset)), testField(155, testInteger(target)))),
+		}
+		if landmark != 0 {
+			fields = append(fields, testField(238, testSymbol(landmark)))
+		}
+		return testStruct(fields...)
+	}
+	container := func(kind uint64, entries ...*ionValue) *ionValue {
+		return testStruct(testField(235, testSymbol(kind)), testField(247, testList(entries...)))
+	}
+	book := &decodedBook{
+		navigation: testList(testStruct(testField(392, testList(
+			container(212, entry("Chapter", 10, 0, 0)),
+			container(236, entry("Cover", 10, 0, 233), entry("", 11, 0, 396)),
+			container(237, entry("7", 10, 2, 0)),
+		)))),
+		anchors: map[uint32]anchor{},
+	}
+	builder := epubBuilder{
+		book: book, nodeSections: map[uint32]int{10: 1, 11: 2},
+		nodePositions: map[uint32]int{10: 1, 11: 1}, nodeTextRunes: map[uint32]int{10: 5},
+	}
+	navigation := builder.navigationDocument()
+	if len(navigation.toc) != 1 || len(navigation.landmarks) != 2 || len(navigation.pages) != 1 {
+		t.Fatalf("navigation = %+v", navigation)
+	}
+	if navigation.landmarks[0].epubType != "cover" || navigation.landmarks[1].epubType != "bodymatter" ||
+		navigation.landmarks[1].label != "Beginning" || !strings.Contains(navigation.pages[0].href, "#kfx-nav-") {
+		t.Fatalf("supplemental navigation = %+v / %+v", navigation.landmarks, navigation.pages)
+	}
+	node := testStruct(testField(155, testInteger(10)))
+	text, err := builder.renderStyledText(node, "hello")
+	if err != nil || !strings.Contains(text, `he<span id="kfx-nav-`) {
+		t.Fatalf("position anchor = %q, %v", text, err)
+	}
+	nav := buildNavigation("Book", "en", nil, navigation)
+	for _, wanted := range []string{`epub:type="landmarks"`, `epub:type="cover"`, `epub:type="bodymatter"`, `epub:type="page-list"`} {
+		if !strings.Contains(nav, wanted) {
+			t.Fatalf("nav document missing %q: %s", wanted, nav)
+		}
 	}
 }
 

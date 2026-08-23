@@ -7,16 +7,17 @@ import (
 
 // ConversionResult describes Leafport's final publication file.
 type ConversionResult struct {
-	Path      string
-	Format    string
-	Pages     int
-	Sections  int
-	Images    int
-	Media     int
-	Fonts     int
-	Resources int
-	ExactCopy bool
-	Privacy   PrivacyResult
+	Path               string
+	Format             string
+	Pages              int
+	Sections           int
+	Images             int
+	Media              int
+	Fonts              int
+	Resources          int
+	ExactCopy          bool
+	BrokenLinksRemoved int
+	Privacy            PrivacyResult
 }
 
 // ConversionOptions controls optional transformations applied while
@@ -96,7 +97,7 @@ func convertBook(book *decodedBook, destinationBase string, metadata Metadata, o
 		}
 		return ConversionResult{
 			Path: path, Format: "PDF", Pages: result.Pages, Resources: result.Resources,
-			ExactCopy: result.ExactCopy, Privacy: privacy,
+			ExactCopy: result.ExactCopy, BrokenLinksRemoved: result.BrokenLinksRemoved, Privacy: privacy,
 		}, nil
 	}
 	if decision.Format == "CBZ" {

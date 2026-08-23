@@ -14,7 +14,8 @@ cover, embedded fonts, reading order, RTL direction, navigation, links, tables,
 images, ruby, MathML, KVG/SVG, supported KFX styling, and supported audio,
 video, button, image-sequence, slideshow, scrollable, and zoomable plugins. PDFs retain title, authors, navigation, RTL
 direction, page dimensions, hyperlinks, high-resolution variants, and tiled
-images. CBZs retain original page bytes, reading order, and ComicBookInfo
+images. Embedded PDF links with a missing or invalid local destination are
+removed before valid KFX links are rebuilt. CBZs retain original page bytes, reading order, and ComicBookInfo
 metadata unless privacy cleanup removes embedded media metadata. A complete
 embedded PDF remains byte-identical only when no KFX navigation, links,
 privacy cleanup, or other PDF-level enhancements must be applied. Mixed
@@ -29,12 +30,16 @@ are decoded with Amazon's [Ion Go](https://github.com/amazon-ion/ion-go).
 PDF assembly and validation
 use the pure-Go [pdfcpu](https://github.com/pdfcpu/pdfcpu) API. The EPUB writer
 is independent because Go EPUB libraries such as
-[go-epub](https://github.com/go-shiori/go-epub) create generic publications but
-do not decode KFX. Evaluated Go metadata packages are limited to particular
+[go-epub](https://github.com/go-shiori/go-epub) and
+[publira/epub](https://github.com/publira/epub) create or inspect generic
+publications but do not decode KFX. Evaluated Go metadata packages are limited to particular
 containers or inspection and do not jointly cover PDF, EPUB, CBZ, rich media,
 KFX semantics, and verified removal. Non-Go comparisons include Calibre/KFX Input,
 [EbookLib](https://github.com/aerkalov/ebooklib), and
-[qpdf](https://github.com/qpdf/qpdf); none is a runtime dependency. JPEG-XR is
+[qpdf](https://github.com/qpdf/qpdf); none is a runtime dependency. The young
+[ebook-rs](https://github.com/SV-stark/ebook-rs) advertises broad Rust format
+support, but describes its KFX parity only as structural text/assets and does
+not provide the macOS reader credential path required here. JPEG-XR is
 rejected explicitly because no independently validated pure-Go decoder is
 currently suitable.
 
@@ -44,13 +49,21 @@ secret. Reader 7.65 stores it as account `kindle.accountsecret.item`, service
 preferences contain only an incompatible 32-character hash. The raw value
 passes through `AuthenticationManager.setAccountSecret:` and then into
 `KRFDRMDataProvider`; the later OpenSSL decrypt call exposes only a derived
-per-book key. Apple documents that Mac Catalyst uses the [Data Protection
+per-book key. Leafport verifies from the Objective-C call graph that the stored
+value is `MD5(raw-secret)` and safely tests exact 40-hex candidates found in
+normally readable reader-owned files without printing them. Reader 7.65 on the
+verified system contains no matching value; its disabled file-keychain fallback
+also has no `userDataDict.dat`. A random 160-bit value cannot practically be
+recovered from its MD5 fingerprint. Apple documents that Mac Catalyst uses the [Data Protection
 Keychain](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains),
 whose access groups come from restricted code-signing
 [entitlements](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps).
 The installed release also has `get-task-allow=false`, so SIP prevents an
 [external debugger or injector](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)
 from attaching. Root alone changes neither rule.
+`doctor` verifies this boundary without retaining a credential: after the
+ordinary disposable bridge reports no raw value, a second disposable bridge
+with the copied reader entitlements is terminated by macOS before returning data.
 Without that raw value, Leafport exports DSN-only books and fails closed for
 `ACCOUNT_SECRET` books. `doctor` reports the affected count. If the raw value
 was obtained independently, `LEAFPORT_ACCOUNT_SECRET` can supply it; Leafport
@@ -61,7 +74,7 @@ not an end-user retrieval path, and Leafport never prompts for it.
 ## Requirements
 
 - Apple silicon Mac
-- Go toolchain compatible with `go.mod`; there is no separate Go 1.25 target
+- Go 1.24 or newer
 - Kindle for Mac with the books downloaded and locally openable
 
 Verified with macOS 26.5.1 and Kindle 7.65 build 1.465815.10.
@@ -102,8 +115,11 @@ one analysis run while still producing the normal PDF/EPUB/CBZ result:
 ```
 
 Artifacts are written with private permissions below
-`TARGET/debug/TIMESTAMP/BOOK_ID/` as `encrypted/` and `BOOK_ID.kfx-zip`.
-They contain sensitive book data and are never removed automatically. With
+`TARGET/debug/TIMESTAMP/BOOK_ID/` as `encrypted/` and `BOOK_ID.kfx-zip`. The
+encrypted copy contains the original voucher, manifest, and reader state; the
+decrypted KFX archive contains only publication `CONT` containers and therefore
+does not duplicate account-bound voucher watermarks. Both still contain
+sensitive book data and are never removed automatically. With
 `--debug`, an existing final PDF/EPUB/CBZ is not overwritten, but its source and
 decrypted archive are captured again.
 
@@ -140,9 +156,15 @@ matching output titles while preserving KFX text offsets. It also strips PDF
 document information, properties, XMP, the source file ID, forms, annotations,
 attachments, active actions, and potentially identifying metadata from JPEG,
 PNG, GIF, WebP, SVG, MP3, WAV, and MP4 assets. Unsupported embedded Ogg, WebM,
-or MPEG metadata fails closed. Automatic detection is conservative:
-it uses explicit owner/account/customer/watermark fields and email-shaped
-metadata values, and never guesses that an author or publisher is the owner.
+or MPEG metadata fails closed. Automatic detection is conservative: it uses
+explicit owner/account/customer/watermark fields and email addresses only when
+they occur in such a field or in contextual text such as “licensed to” or
+“delivered to”. A bare author or publisher contact address is not classified as
+the owner.
+Ordinary final exports already omit the account-bound DRM voucher and its opaque
+watermark. Privacy cleanup is therefore optional and primarily intended for
+explicit user-supplied patterns or unusual publications with visible owner
+markers; it is not enabled by default.
 Personal data inside embedded PDF page-content streams or image pixels cannot
 be reliably detected without content rewriting or OCR and pixel modification;
 it is not claimed as removed. Existing outputs are not overwritten; when
@@ -167,10 +189,25 @@ Maintenance commands for future binary analysis remain part of the same CLI:
 ./leafport debug disasm --help
 ./leafport debug dylibify --help
 ./leafport debug capture --help
+./leafport debug credentials --help
 ./leafport debug kfx --help
 ./leafport debug pdf --help
 ./leafport debug objc --help
 ```
+
+`debug credentials` reports only scan counts and whether the stored fingerprint
+has a verified local preimage. `debug objc --calls --references` resolves
+selectors, classes, and constant strings for future reader-build audits.
+
+For future converter audits, list only the semantic IDs used by a decrypted
+archive, without printing book text:
+
+```sh
+./leafport debug kfx --in BOOK.kfx-zip --features
+```
+
+`--extract-resources DIRECTORY` retains untouched embedded PDFs, images, fonts,
+or media with private permissions for source-vs-output diagnostics.
 
 ## Implementation and compatibility
 
@@ -179,7 +216,10 @@ Leafport reads titles through `database/sql` and the cgo-free
 reader runtime, captures the per-book content key in memory, decrypts DRMION
 records in Go, parses Binary Ion/KFX in Go, and writes validated PDF, EPUB, or
 CBZ output. EPUB packaging follows EPUB 3/OCF rules, including an uncompressed,
-descriptor-free first `mimetype` entry. The installed app is not modified.
+descriptor-free first `mimetype` entry. Reconstructed navigation includes the
+TOC, typed landmarks, page lists, exact text-offset anchors, noterefs, and
+endnotes; table spans are resolved through inherited KFX styles. The installed
+app is not modified.
 
 Support remains version-sensitive. Verified builds are matched by both Mach-O
 UUID and `__text` hash. Unknown builds use a strict semantic fallback that

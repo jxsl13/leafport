@@ -38,6 +38,8 @@ func Run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 		return runDebugDylibify(arguments[1:], stderr)
 	case "capture":
 		return runDebugCapture(ctx, arguments[1:], stdout, stderr)
+	case "credentials":
+		return runDebugCredentials(arguments[1:], stdout, stderr)
 	case "kfx":
 		return runDebugKFX(arguments[1:], stdout, stderr)
 	case "pdf":
@@ -55,6 +57,7 @@ func printDebugUsage(writer io.Writer) {
   leafport debug disasm [flags]
   leafport debug dylibify --in SOURCE --out DESTINATION
   leafport debug capture --id BOOK_ID --out ARCHIVE
+  leafport debug credentials --preferences PATH [--root PATH]
   leafport debug kfx --in ARCHIVE
   leafport debug pdf --in FILE
   leafport debug objc [--binary PATH] [--class REGEX]
@@ -64,6 +67,7 @@ Debug subcommands:
   disasm    inspect a small arm64 Mach-O address range or find references
   dylibify  make a disposable MH_DYLIB copy of a thin 64-bit Mach-O
   capture   retain one decrypted KFX archive for maintenance analysis
+  credentials safely test reader-owned files against the stored secret fingerprint
   kfx       validate and classify a decrypted KFX archive
   pdf       validate PDF pages, outlines, and link annotations
   objc      list per-class Objective-C methods and implementation addresses`)
@@ -76,6 +80,8 @@ func runDebugKFX(arguments []string, stdout, stderr io.Writer) error {
 	typeList := flags.String("types", "", "comma-separated entity type IDs to dump")
 	limit := flags.Int("limit", 20, "maximum dumped entities")
 	showPlan := flags.Bool("plan", false, "derive fixed-layout resource order")
+	showFeatures := flags.Bool("features", false, "list semantic feature IDs without book text")
+	extractResources := flags.String("extract-resources", "", "write untouched raw resources to a private analysis directory")
 	dependency := flags.Uint64("dependency", 0, "dump dependencies for one numeric fragment ID")
 	node := flags.Uint64("node", 0, "dump content nodes with one numeric location ID")
 	pdfOut := flags.String("pdf-out", "", "write reconstructed fixed-layout PDF")
@@ -122,6 +128,36 @@ func runDebugKFX(arguments []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "Ordered page resources: %d (%d PDF, %d raster across %d raw resources)\n",
 			len(pages), pdfPages, len(pages)-pdfPages, len(locations))
 	}
+	if *showFeatures {
+		features, featureErr := kfxconvert.InspectFeatures(*input)
+		if featureErr != nil {
+			return fmt.Errorf("debug kfx: inspect features: %w", featureErr)
+		}
+		printFeatureIDs := func(name string, values []uint32) {
+			items := make([]string, len(values))
+			for index, value := range values {
+				items[index] = fmt.Sprintf("$%d", value)
+			}
+			fmt.Fprintf(stdout, "%s: %s\n", name, strings.Join(items, ", "))
+		}
+		printFeatureIDs("Entity types", features.EntityTypes)
+		printFeatureIDs("Content types", features.ContentTypes)
+		printFeatureIDs("Layouts", features.Layouts)
+		printFeatureIDs("Style fields", features.StyleFields)
+		printFeatureIDs("Content fields", features.ContentFields)
+		printFeatureIDs("Annotation types", features.AnnotationTypes)
+		printFeatureIDs("Classifications", features.Classifications)
+		printFeatureIDs("Resource formats", features.ResourceFormats)
+	}
+	if *extractResources != "" {
+		resources, extractErr := kfxconvert.ExtractRawResources(*input, *extractResources)
+		if extractErr != nil {
+			return fmt.Errorf("debug kfx: extract resources: %w", extractErr)
+		}
+		for _, resource := range resources {
+			fmt.Fprintf(stdout, "Resource: %s -> %s (%d bytes)\n", resource.Source, resource.Path, resource.Size)
+		}
+	}
 	if *typeList != "" {
 		var types []uint32
 		for _, item := range strings.Split(*typeList, ",") {
@@ -155,6 +191,9 @@ func runDebugKFX(arguments []string, stdout, stderr io.Writer) error {
 		}
 		fmt.Fprintf(stdout, "PDF: %s (%d pages from %d resource groups; exact copy: %t)\n",
 			*pdfOut, result.Pages, result.Resources, result.ExactCopy)
+		if result.BrokenLinksRemoved != 0 {
+			fmt.Fprintf(stdout, "Removed nonfunctional embedded-PDF links: %d\n", result.BrokenLinksRemoved)
+		}
 	}
 	if *epubOut != "" {
 		result, err := kfxconvert.ConvertToEPUB(*input, *epubOut, kfxconvert.Metadata{})

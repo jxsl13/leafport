@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,15 +17,17 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 var disablePDFCPUConfig sync.Once
 
 // PDFResult summarizes a fixed-layout PDF reconstruction.
 type PDFResult struct {
-	Pages     int
-	Resources int
-	ExactCopy bool
+	Pages              int
+	Resources          int
+	ExactCopy          bool
+	BrokenLinksRemoved int
 }
 
 // ConvertToPDF reconstructs a PDF-backed fixed-layout KFX publication. The
@@ -125,6 +128,14 @@ func convertFixedLayoutPagesToPDF(book *decodedBook, pages []Page, destination s
 		return result, err
 	}
 	file = nil
+	removedLinks, cleanupErr := removeBrokenPDFLinks(destination)
+	if cleanupErr != nil {
+		return result, fmt.Errorf("remove nonfunctional embedded PDF links: %w", cleanupErr)
+	}
+	if removedLinks != 0 {
+		result.BrokenLinksRemoved = removedLinks
+		result.ExactCopy = false
+	}
 	if !result.ExactCopy {
 		if properties := pdfProperties(metadata); len(properties) != 0 {
 			if err = api.AddPropertiesFile(destination, "", properties, pdfConfiguration()); err != nil {
@@ -163,6 +174,97 @@ func convertFixedLayoutPagesToPDF(book *decodedBook, pages []Page, destination s
 	}
 	complete = true
 	return result, nil
+}
+
+// removeBrokenPDFLinks removes only link annotations that cannot perform an
+// action: missing/invalid local destinations or a missing action entirely.
+// Other action types are retained because their validity can depend on an
+// external viewer or file. This is especially important for samples whose
+// embedded source PDFs contain disabled GoTo actions for unavailable pages.
+func removeBrokenPDFLinks(path string) (int, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	context, err := api.ReadAndValidate(file, pdfConfiguration())
+	if err != nil {
+		_ = file.Close()
+		return 0, err
+	}
+	objectNumbers := make(map[int]bool)
+	for pageNumber := 1; pageNumber <= context.PageCount; pageNumber++ {
+		page, _, _, pageErr := context.PageDict(pageNumber, false)
+		if pageErr != nil {
+			_ = file.Close()
+			return 0, pageErr
+		}
+		annotations, annotationErr := context.DereferenceArray(page["Annots"])
+		if annotationErr != nil {
+			_ = file.Close()
+			return 0, annotationErr
+		}
+		for index, annotationObject := range annotations {
+			annotation, dereferenceErr := context.DereferenceDict(annotationObject)
+			if dereferenceErr != nil {
+				_ = file.Close()
+				return 0, dereferenceErr
+			}
+			if annotation == nil || annotation.NameEntry("Subtype") == nil || *annotation.NameEntry("Subtype") != "Link" ||
+				!brokenPDFLink(context, annotation) {
+				continue
+			}
+			indirect, ok := annotationObject.(types.IndirectRef)
+			if !ok {
+				_ = file.Close()
+				return 0, fmt.Errorf("page %d annotation %d is a nonfunctional direct link that cannot be removed selectively", pageNumber, index)
+			}
+			objectNumbers[indirect.ObjectNumber.Value()] = true
+		}
+	}
+	if err := file.Close(); err != nil {
+		return 0, err
+	}
+	if len(objectNumbers) == 0 {
+		return 0, nil
+	}
+	objects := make([]int, 0, len(objectNumbers))
+	for objectNumber := range objectNumbers {
+		objects = append(objects, objectNumber)
+	}
+	sort.Ints(objects)
+	if err := api.RemoveAnnotationsFile(path, "", nil, nil, objects, pdfConfiguration(), false); err != nil {
+		return 0, err
+	}
+	return len(objects), nil
+}
+
+func brokenPDFLink(context *model.Context, annotation types.Dict) bool {
+	if destination, ok := annotation["Dest"]; ok {
+		return !pdfDestinationResolves(context, destination)
+	}
+	action, err := context.DereferenceDict(annotation["A"])
+	if err != nil || action == nil || action.NameEntry("S") == nil {
+		return true
+	}
+	switch *action.NameEntry("S") {
+	case "GoTo":
+		destination, ok := action["D"]
+		return !ok || !pdfDestinationResolves(context, destination)
+	case "URI":
+		uriObject, ok := action["URI"]
+		if !ok {
+			return true
+		}
+		uri, uriErr := context.DereferenceText(uriObject)
+		return uriErr != nil || strings.TrimSpace(uri) == ""
+	default:
+		return false
+	}
+}
+
+func pdfDestinationResolves(context *model.Context, destination types.Object) bool {
+	page, err := pdfcpu.PageNrFromDestination(context, destination)
+	return err == nil && page >= 1 && page <= context.PageCount
 }
 
 func convertImageLayoutPagesToPDF(book *decodedBook, pages []Page, destination string, metadata Metadata) (result PDFResult, err error) {
