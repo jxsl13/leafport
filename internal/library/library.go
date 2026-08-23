@@ -15,7 +15,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"leafport/internal/bookmeta"
+	"github.com/jxsl13/leafport/internal/bookmeta"
 )
 
 // Book describes one complete locally downloaded book bundle.

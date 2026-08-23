@@ -14,10 +14,10 @@ import (
 	"strconv"
 	"strings"
 
-	"leafport/internal/kfxdrm"
-	"leafport/internal/library"
-	"leafport/internal/machoutil"
-	"leafport/internal/runtimebridge"
+	"github.com/jxsl13/leafport/internal/kfxdrm"
+	"github.com/jxsl13/leafport/internal/library"
+	"github.com/jxsl13/leafport/internal/machoutil"
+	"github.com/jxsl13/leafport/internal/runtimebridge"
 )
 
 // RuntimeCommand identifies the private invocation used by the disposable

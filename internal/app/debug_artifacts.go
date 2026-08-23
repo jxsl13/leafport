@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"leafport/internal/exporter"
+	"github.com/jxsl13/leafport/internal/exporter"
 )
 
 func prepareDebugRoot(target string, now time.Time) (string, error) {

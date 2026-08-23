@@ -5,7 +5,7 @@ package runtimebridge
 import (
 	"errors"
 
-	"leafport/internal/machoutil"
+	"github.com/jxsl13/leafport/internal/machoutil"
 )
 
 type Capture struct {

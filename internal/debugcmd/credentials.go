@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"leafport/internal/readerconfig"
+	"github.com/jxsl13/leafport/internal/readerconfig"
 )
 
 func runDebugCredentials(arguments []string, stdout, stderr io.Writer) error {

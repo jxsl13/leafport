@@ -12,10 +12,10 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"leafport/internal/app"
-	"leafport/internal/debugcmd"
-	"leafport/internal/exporter"
-	"leafport/internal/kfxconvert"
+	"github.com/jxsl13/leafport/internal/app"
+	"github.com/jxsl13/leafport/internal/debugcmd"
+	"github.com/jxsl13/leafport/internal/exporter"
+	"github.com/jxsl13/leafport/internal/kfxconvert"
 )
 
 // Run executes Leafport with explicit arguments and streams.

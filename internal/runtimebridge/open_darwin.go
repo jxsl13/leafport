@@ -18,9 +18,9 @@ import (
 	"github.com/ebitengine/purego/objc"
 	"golang.org/x/arch/arm64/arm64asm"
 
-	"leafport/internal/compatibility"
-	"leafport/internal/machoutil"
-	"leafport/internal/readerconfig"
+	"github.com/jxsl13/leafport/internal/compatibility"
+	"github.com/jxsl13/leafport/internal/machoutil"
+	"github.com/jxsl13/leafport/internal/readerconfig"
 )
 
 const foundationPath = "/System/Library/Frameworks/Foundation.framework/Foundation"

@@ -12,8 +12,8 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"leafport/internal/exporter"
-	"leafport/internal/library"
+	"github.com/jxsl13/leafport/internal/exporter"
+	"github.com/jxsl13/leafport/internal/library"
 )
 
 func runDebugCapture(ctx context.Context, arguments []string, stdout, stderr io.Writer) (err error) {

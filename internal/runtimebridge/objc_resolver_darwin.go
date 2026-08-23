@@ -12,7 +12,7 @@ import (
 	"github.com/ebitengine/purego"
 	"github.com/ebitengine/purego/objc"
 
-	"leafport/internal/compatibility"
+	"github.com/jxsl13/leafport/internal/compatibility"
 )
 
 type objectiveCClassRequirement struct {

@@ -18,9 +18,9 @@ import (
 	"github.com/spf13/pflag"
 	"golang.org/x/arch/arm64/arm64asm"
 
-	"leafport/internal/compatibility"
-	"leafport/internal/kfxconvert"
-	"leafport/internal/machoutil"
+	"github.com/jxsl13/leafport/internal/compatibility"
+	"github.com/jxsl13/leafport/internal/kfxconvert"
+	"github.com/jxsl13/leafport/internal/machoutil"
 )
 
 // Run executes one debug subcommand.

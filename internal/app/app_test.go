@@ -10,8 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"leafport/internal/exporter"
-	"leafport/internal/library"
+	"github.com/jxsl13/leafport/internal/exporter"
+	"github.com/jxsl13/leafport/internal/library"
 )
 
 func TestPrepareTargetDirectory(t *testing.T) {

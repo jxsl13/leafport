@@ -9,7 +9,7 @@ import (
 
 	"github.com/ebitengine/purego/objc"
 
-	"leafport/internal/compatibility"
+	"github.com/jxsl13/leafport/internal/compatibility"
 )
 
 func TestResolveObjectiveCClassPrefersKnownName(t *testing.T) {

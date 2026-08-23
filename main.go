@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"leafport/internal/cli"
+	"github.com/jxsl13/leafport/internal/cli"
 )
 
 func main() {

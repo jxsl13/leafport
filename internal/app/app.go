@@ -13,10 +13,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"leafport/internal/exporter"
-	"leafport/internal/kfxconvert"
-	"leafport/internal/library"
-	"leafport/internal/readerconfig"
+	"github.com/jxsl13/leafport/internal/exporter"
+	"github.com/jxsl13/leafport/internal/kfxconvert"
+	"github.com/jxsl13/leafport/internal/library"
+	"github.com/jxsl13/leafport/internal/readerconfig"
 )
 
 // Config contains values parsed from the command line.
