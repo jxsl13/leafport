@@ -23,6 +23,21 @@ import (
 type doctorState struct {
 	output   Streams
 	failures []error
+	findings []doctorFinding
+}
+
+type doctorSeverity uint8
+
+const (
+	doctorPass doctorSeverity = iota
+	doctorWarn
+	doctorFail
+)
+
+type doctorFinding struct {
+	severity doctorSeverity
+	name     string
+	detail   string
 }
 
 // Doctor checks local discovery and the complete disposable runtime bridge
@@ -203,9 +218,10 @@ func Doctor(ctx context.Context, config Config, streams Streams) error {
 		}
 	}
 
+	state.writeFindings()
 	if len(state.failures) != 0 {
 		fmt.Fprintf(streams.Stdout, "Doctor result: FAIL (%d blocking issue(s))\n", len(state.failures))
-		return fmt.Errorf("doctor found %d blocking issue(s)", len(state.failures))
+		return reportedError{err: fmt.Errorf("doctor found %d blocking issue(s)", len(state.failures))}
 	}
 	fmt.Fprintln(streams.Stdout, "Doctor result: PASS")
 	return nil
@@ -314,16 +330,57 @@ func checkPreferences(state *doctorState, roots []library.Root) string {
 }
 
 func (state *doctorState) pass(name, detail string) {
-	fmt.Fprintf(state.output.Stdout, "[PASS] %s: %s\n", name, detail)
+	state.findings = append(state.findings, doctorFinding{
+		severity: doctorPass,
+		name:     name,
+		detail:   detail,
+	})
 }
 
 func (state *doctorState) warn(name, detail string) {
-	fmt.Fprintf(state.output.Stdout, "[WARN] %s: %s\n", name, detail)
+	state.findings = append(state.findings, doctorFinding{
+		severity: doctorWarn,
+		name:     name,
+		detail:   detail,
+	})
 }
 
 func (state *doctorState) fail(name string, err error) {
 	state.failures = append(state.failures, fmt.Errorf("%s: %w", name, err))
-	fmt.Fprintf(state.output.Stdout, "[FAIL] %s: %v\n", name, err)
+	state.findings = append(state.findings, doctorFinding{
+		severity: doctorFail,
+		name:     name,
+		detail:   err.Error(),
+	})
+}
+
+func (state *doctorState) writeFindings() {
+	sort.Slice(state.findings, func(left, right int) bool {
+		first := state.findings[left]
+		second := state.findings[right]
+		if first.severity != second.severity {
+			return first.severity > second.severity
+		}
+		if first.name != second.name {
+			return first.name < second.name
+		}
+		return first.detail < second.detail
+	})
+	for _, finding := range state.findings {
+		fmt.Fprintf(state.output.Stdout, "[%s] %s: %s\n",
+			finding.severity.label(), finding.name, finding.detail)
+	}
+}
+
+func (severity doctorSeverity) label() string {
+	switch severity {
+	case doctorFail:
+		return "FAIL"
+	case doctorWarn:
+		return "WARN"
+	default:
+		return "PASS"
+	}
 }
 
 func (state *doctorState) require(ok bool, name, detail string, err error) {
