@@ -3,6 +3,7 @@ package machoutil
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/blacktop/go-macho/pkg/codesign"
@@ -22,15 +23,15 @@ func AdHocSign(data []byte, identifier string) ([]byte, error) {
 // whether restricted entitlements are valid for an ad-hoc identity.
 func AdHocSignWithEntitlements(data []byte, identifier string, entitlements []byte) ([]byte, error) {
 	if identifier == "" {
-		return nil, fmt.Errorf("code-signing identifier is empty")
+		return nil, errors.New("code-signing identifier is empty")
 	}
 	if len(data) < 32 || binary.LittleEndian.Uint32(data[:4]) != mhMagic64 {
-		return nil, fmt.Errorf("input is not a thin little-endian 64-bit Mach-O")
+		return nil, errors.New("input is not a thin little-endian 64-bit Mach-O")
 	}
 	ncmds := binary.LittleEndian.Uint32(data[16:20])
 	commandsEnd := uint64(32) + uint64(binary.LittleEndian.Uint32(data[20:24]))
 	if commandsEnd > uint64(len(data)) {
-		return nil, fmt.Errorf("truncated Mach-O load commands")
+		return nil, errors.New("truncated Mach-O load commands")
 	}
 	var signatureOffset, signatureSize uint32
 	var textOffset, textSize uint64
@@ -49,7 +50,7 @@ func AdHocSignWithEntitlements(data []byte, identifier string, entitlements []by
 		switch command {
 		case lcCodeSignature:
 			if commandSize < 16 {
-				return nil, fmt.Errorf("truncated LC_CODE_SIGNATURE")
+				return nil, errors.New("truncated LC_CODE_SIGNATURE")
 			}
 			signatureCommand = offset
 			signatureOffset = binary.LittleEndian.Uint32(data[offset+8 : offset+12])
@@ -70,14 +71,14 @@ func AdHocSignWithEntitlements(data []byte, identifier string, entitlements []by
 		offset += uint64(commandSize)
 	}
 	if signatureOffset == 0 || signatureSize == 0 {
-		return nil, fmt.Errorf("Mach-O has no embedded code-signature slot")
+		return nil, errors.New("Mach-O has no embedded code-signature slot")
 	}
 	signatureEnd := uint64(signatureOffset) + uint64(signatureSize)
 	if signatureEnd > uint64(len(data)) || uint64(signatureOffset) < commandsEnd {
-		return nil, fmt.Errorf("invalid embedded code-signature range")
+		return nil, errors.New("invalid embedded code-signature range")
 	}
 	if signatureCommand == 0 || linkeditCommand == 0 || linkeditFileOffset > uint64(signatureOffset) {
-		return nil, fmt.Errorf("Mach-O code-signature or __LINKEDIT command is invalid")
+		return nil, errors.New("Mach-O code-signature or __LINKEDIT command is invalid")
 	}
 	config := &codesign.Config{
 		ID:           identifier,
@@ -124,12 +125,12 @@ func AdHocSignWithEntitlements(data []byte, identifier string, entitlements []by
 // EmbeddedEntitlements returns the XML entitlement plist from a thin Mach-O.
 func EmbeddedEntitlements(data []byte) ([]byte, error) {
 	if len(data) < 32 || binary.LittleEndian.Uint32(data[:4]) != mhMagic64 {
-		return nil, fmt.Errorf("input is not a thin little-endian 64-bit Mach-O")
+		return nil, errors.New("input is not a thin little-endian 64-bit Mach-O")
 	}
 	ncmds := binary.LittleEndian.Uint32(data[16:20])
 	commandsEnd := uint64(32) + uint64(binary.LittleEndian.Uint32(data[20:24]))
 	if commandsEnd > uint64(len(data)) {
-		return nil, fmt.Errorf("truncated Mach-O load commands")
+		return nil, errors.New("truncated Mach-O load commands")
 	}
 	offset := uint64(32)
 	for index := uint32(0); index < ncmds; index++ {
@@ -142,26 +143,26 @@ func EmbeddedEntitlements(data []byte) ([]byte, error) {
 		}
 		if binary.LittleEndian.Uint32(data[offset:offset+4]) == lcCodeSignature {
 			if commandSize < 16 {
-				return nil, fmt.Errorf("truncated LC_CODE_SIGNATURE")
+				return nil, errors.New("truncated LC_CODE_SIGNATURE")
 			}
 			signatureOffset := binary.LittleEndian.Uint32(data[offset+8 : offset+12])
 			signatureSize := binary.LittleEndian.Uint32(data[offset+12 : offset+16])
 			signatureEnd := uint64(signatureOffset) + uint64(signatureSize)
 			if signatureEnd > uint64(len(data)) {
-				return nil, fmt.Errorf("invalid embedded code-signature range")
+				return nil, errors.New("invalid embedded code-signature range")
 			}
 			signature, err := codesign.ParseCodeSignature(data[signatureOffset:signatureEnd])
 			if err != nil {
 				return nil, fmt.Errorf("parse embedded code signature: %w", err)
 			}
 			if signature.Entitlements == "" {
-				return nil, fmt.Errorf("embedded code signature has no XML entitlements")
+				return nil, errors.New("embedded code signature has no XML entitlements")
 			}
 			return []byte(signature.Entitlements), nil
 		}
 		offset += uint64(commandSize)
 	}
-	return nil, fmt.Errorf("Mach-O has no embedded code signature")
+	return nil, errors.New("Mach-O has no embedded code signature")
 }
 
 func align(value, alignment uint64) uint64 {

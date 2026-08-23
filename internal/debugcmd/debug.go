@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -118,7 +118,7 @@ func runDebugKFX(arguments []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("debug kfx: derive page plan: %w", planErr)
 		}
 		pdfPages := 0
-		locations := make(map[string]bool)
+		locations := make(map[string]bool, len(pages))
 		for _, page := range pages {
 			if page.Format == 565 {
 				pdfPages++
@@ -160,7 +160,7 @@ func runDebugKFX(arguments []string, stdout, stderr io.Writer) error {
 	}
 	if *typeList != "" {
 		var types []uint32
-		for _, item := range strings.Split(*typeList, ",") {
+		for item := range strings.SplitSeq(*typeList, ",") {
 			value, parseErr := strconv.ParseUint(strings.TrimSpace(item), 10, 32)
 			if parseErr != nil {
 				return fmt.Errorf("debug kfx: invalid entity type %q", item)
@@ -336,7 +336,7 @@ func objectiveCMetadata(file *macho.File, sectionName string) []string {
 	for value := range seen {
 		values = append(values, value)
 	}
-	sort.Strings(values)
+	slices.Sort(values)
 	return values
 }
 

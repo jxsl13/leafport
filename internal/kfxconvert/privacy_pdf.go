@@ -2,6 +2,7 @@ package kfxconvert
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
@@ -79,7 +80,7 @@ func removePDFDocumentInfo(context *model.Context) error {
 			return fmt.Errorf("read PDF document information: %w", err)
 		}
 		if info == nil {
-			return fmt.Errorf("read PDF document information: missing object")
+			return errors.New("read PDF document information: missing object")
 		}
 		// An information value may itself be indirect. Clearing the referenced
 		// object prevents a removed owner string from surviving as unreachable
@@ -154,7 +155,7 @@ func verifySanitizedPDF(data []byte) error {
 		return fmt.Errorf("verify PDF document information: %w", err)
 	}
 	if info.Title != "" || info.Author != "" || info.Subject != "" || info.Creator != "" || len(info.Keywords) != 0 {
-		return fmt.Errorf("metadata-free PDF still contains standard document information")
+		return errors.New("metadata-free PDF still contains standard document information")
 	}
 	context, err := api.ReadValidateAndOptimize(bytes.NewReader(data), pdfConfiguration())
 	if err != nil {

@@ -76,7 +76,7 @@ func convertImageLayoutPagesToCBZ(book *decodedBook, pages []Page, destination s
 		}
 	}
 	width := max(4, len(fmt.Sprintf("%d", len(pages))))
-	locations := make(map[string]bool)
+	locations := make(map[string]bool, len(pages))
 	for index, page := range pages {
 		extension, mediaType, ok := cbzImageType(page.Data)
 		if !ok {

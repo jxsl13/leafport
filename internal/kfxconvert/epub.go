@@ -12,7 +12,7 @@ import (
 	"net/url"
 	"os"
 	pathpkg "path"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -275,7 +275,7 @@ func (book *decodedBook) coverResourceID() uint32 {
 func (builder *epubBuilder) renderSection(sectionID uint32, number int) (epubSection, error) {
 	section := builder.book.sections[sectionID]
 	if section == nil {
-		return epubSection{}, fmt.Errorf("missing section")
+		return epubSection{}, errors.New("missing section")
 	}
 	pageTemplates := ionFieldValue(section, 141)
 	storyIDs := uniqueSymbols(pageTemplates, 176)
@@ -693,8 +693,8 @@ func (builder *epubBuilder) prepareFonts() {
 	for location := range builder.book.rawFonts {
 		locations = append(locations, location)
 	}
-	sort.Strings(locations)
-	assets := make(map[string]*epubFontAsset)
+	slices.Sort(locations)
+	assets := make(map[string]*epubFontAsset, len(locations))
 	for _, location := range locations {
 		extension, mediaType, ok := fontMediaType(builder.book.rawFonts[location])
 		if !ok {

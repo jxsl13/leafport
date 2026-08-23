@@ -126,8 +126,10 @@ func writeBookList(output io.Writer, books []library.Book, wide bool) error {
 	return table.Flush()
 }
 
+var tableCellReplacer = strings.NewReplacer("\t", " ", "\n", " ", "\r", " ")
+
 func tableCell(value string) string {
-	return strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(value)
+	return tableCellReplacer.Replace(value)
 }
 
 func runBatch(ctx context.Context, config Config, streams Streams, target string, books []library.Book) (err error) {

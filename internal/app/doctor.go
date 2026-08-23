@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 
@@ -104,7 +105,7 @@ func Doctor(ctx context.Context, config Config, streams Streams) error {
 			for _, root := range roots {
 				paths = append(paths, root.Path)
 			}
-			sort.Strings(paths)
+			slices.Sort(paths)
 			state.pass("Local library", fmt.Sprintf("%d root(s): %v", len(paths), paths))
 			preferencesPath = checkPreferences(state, roots)
 			books, warnings, booksErr := library.DiscoverBooks(ctx, roots)
@@ -305,7 +306,7 @@ func containsString(values []string, wanted string) bool {
 }
 
 func checkPreferences(state *doctorState, roots []library.Root) string {
-	seen := make(map[string]bool)
+	seen := make(map[string]bool, len(roots))
 	valid := 0
 	first := ""
 	for _, root := range roots {

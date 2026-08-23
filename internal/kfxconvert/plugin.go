@@ -7,7 +7,7 @@ import (
 	"math"
 	"math/big"
 	"net/url"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -341,7 +341,7 @@ func (builder *epubBuilder) resolvePluginResource(rawURI string) (resolvedPlugin
 	for id := range builder.book.resources {
 		ids = append(ids, int(id))
 	}
-	sort.Ints(ids)
+	slices.Sort(ids)
 	for _, numericID := range ids {
 		id := uint32(numericID)
 		metadata := builder.book.resources[id]
@@ -438,7 +438,7 @@ func pluginMediaType(data []byte, declaredMIME, expectedKind string) (extension,
 	if extension, mediaType, ok = imageMediaType(data); ok {
 		return extension, mediaType, expectedKind == "image" || expectedKind == "any"
 	}
-	declaredMIME = strings.ToLower(strings.TrimSpace(strings.Split(declaredMIME, ";")[0]))
+	declaredMIME = strings.ToLower(strings.TrimSpace(strings.SplitN(declaredMIME, ";", 2)[0]))
 	known := map[string][2]string{
 		"audio/aac":   {"aac", "audio/aac"},
 		"audio/mp4":   {"m4a", "audio/mp4"},

@@ -229,7 +229,7 @@ func (batch *Batch) ExportWithOptions(ctx context.Context, output library.Output
 	waitErr := command.Wait()
 	read := <-resultChannel
 	if diagnostics := filterRuntimeDiagnostics(runtimeStderr.String()); diagnostics != "" && batch.config.Stderr != nil {
-		fmt.Fprint(batch.config.Stderr, diagnostics)
+		io.WriteString(batch.config.Stderr, diagnostics)
 	}
 	if waitErr != nil {
 		if read.archive.Path != "" {
@@ -291,7 +291,7 @@ func (batch *Batch) readerHome(preferences string) (batchHome, error) {
 
 func filterRuntimeDiagnostics(value string) string {
 	var output strings.Builder
-	for _, line := range strings.SplitAfter(value, "\n") {
+	for line := range strings.SplitAfterSeq(value, "\n") {
 		if index := strings.Index(line, "leafport:"); index >= 0 {
 			output.WriteString(line[index:])
 			if !strings.HasSuffix(line, "\n") {

@@ -9,7 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -231,7 +231,7 @@ func removeBrokenPDFLinks(path string) (int, error) {
 	for objectNumber := range objectNumbers {
 		objects = append(objects, objectNumber)
 	}
-	sort.Ints(objects)
+	slices.Sort(objects)
 	if err := api.RemoveAnnotationsFile(path, "", nil, nil, objects, pdfConfiguration(), false); err != nil {
 		return 0, err
 	}
@@ -269,7 +269,7 @@ func pdfDestinationResolves(context *model.Context, destination types.Object) bo
 
 func convertImageLayoutPagesToPDF(book *decodedBook, pages []Page, destination string, metadata Metadata) (result PDFResult, err error) {
 	readers := make([]io.Reader, 0, len(pages))
-	locations := make(map[string]bool)
+	locations := make(map[string]bool, len(pages))
 	for index, page := range pages {
 		if page.Format == kfxPDFFormat {
 			return result, fmt.Errorf("fixed-layout page %d unexpectedly contains PDF data", index+1)
@@ -340,7 +340,7 @@ func convertMixedLayoutPagesToPDF(book *decodedBook, pages []Page, destination s
 		files = append(files, file)
 		readers = append(readers, file)
 	}
-	locations := make(map[string]bool)
+	locations := make(map[string]bool, len(pages))
 	for _, page := range pages {
 		locations[page.Location] = true
 	}

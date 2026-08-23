@@ -1,13 +1,16 @@
 package kfxconvert
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 type inlineStyleEvent struct {
@@ -60,7 +63,7 @@ func (builder *epubBuilder) indexContent(value *ionValue, section int, seenStori
 			builder.sectionNodeCount[section]++
 			builder.nodePositions[uint32(id)] = builder.sectionNodeCount[section]
 			if text, err := builder.book.nodeText(value); err == nil {
-				builder.nodeTextRunes[uint32(id)] = len([]rune(text))
+				builder.nodeTextRunes[uint32(id)] = utf8.RuneCountInString(text)
 			}
 		}
 		// Mirror renderValues branch precedence so navigation never points at
@@ -324,7 +327,7 @@ func renderInlineRange(runes []rune, rangeStart, rangeEnd int, events []inlineSt
 			boundaries = append(boundaries, event.end)
 		}
 	}
-	sort.Ints(boundaries)
+	slices.Sort(boundaries)
 	boundaries = uniqueInts(boundaries)
 	var output strings.Builder
 	for index := 0; index+1 < len(boundaries); index++ {
@@ -481,8 +484,8 @@ func (builder *epubBuilder) inlineTextAnchors(node *ionValue, textLength int) ma
 			result[offset] = append(result[offset], ids...)
 		}
 	}
-	for offset := range result {
-		sort.Strings(result[offset])
+	for _, anchorIDs := range result {
+		slices.Sort(anchorIDs)
 	}
 	return result
 }
@@ -644,11 +647,11 @@ func (builder *epubBuilder) parseNavigationEntries(value *ionValue, kind uint64)
 	// EPUB navigation targets must occur in reading order. KFX navigation
 	// containers occasionally list front matter out of spine order, so derive
 	// the portable order from the rendered section and node positions.
-	sort.SliceStable(result, func(left, right int) bool {
-		if result[left].section != result[right].section {
-			return result[left].section < result[right].section
+	slices.SortStableFunc(result, func(left, right epubNavigationItem) int {
+		if left.section != right.section {
+			return cmp.Compare(left.section, right.section)
 		}
-		return result[left].position < result[right].position
+		return cmp.Compare(left.position, right.position)
 	})
 	return result
 }
@@ -671,7 +674,7 @@ func (builder *epubBuilder) styleSheet() string {
 	for id := range builder.book.styles {
 		ids = append(ids, int(id))
 	}
-	sort.Ints(ids)
+	slices.Sort(ids)
 	var css strings.Builder
 	css.WriteString(defaultEPUBCSS)
 	for _, face := range builder.fontFaces {
@@ -699,7 +702,7 @@ func (builder *epubBuilder) styleSheet() string {
 			for name := range properties {
 				names = append(names, name)
 			}
-			sort.Strings(names)
+			slices.Sort(names)
 			fmt.Fprintf(&css, ".kfx-s%d {", id)
 			for _, name := range names {
 				fmt.Fprintf(&css, "%s:%s;", name, properties[name])
@@ -1071,10 +1074,12 @@ func safeFontFamily(value string) string {
 	return strings.Join(filtered, ", ")
 }
 
+var cssWhitespaceReplacer = strings.NewReplacer("\r", " ", "\n", " ", "\f", " ")
+
 func cssString(value string) string {
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	value = strings.ReplaceAll(value, "\"", "\\\"")
-	value = strings.NewReplacer("\r", " ", "\n", " ", "\f", " ").Replace(value)
+	value = cssWhitespaceReplacer.Replace(value)
 	return `"` + value + `"`
 }
 

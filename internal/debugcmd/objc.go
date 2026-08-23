@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"sort"
 
 	gomacho "github.com/blacktop/go-macho"
@@ -146,7 +147,7 @@ func objectiveCMethodEnds(classes []objc.Class, base uint64) map[uint64]uint64 {
 			}
 		}
 	}
-	sort.Slice(addresses, func(i, j int) bool { return addresses[i] < addresses[j] })
+	slices.Sort(addresses)
 	ends := make(map[uint64]uint64, len(addresses))
 	for index, address := range addresses {
 		end := address + 4096

@@ -2,7 +2,7 @@ package kfxconvert
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -49,7 +49,7 @@ func validateEPUBFeatureSupport(book *decodedBook) error {
 	for feature := range unsupported {
 		features = append(features, feature)
 	}
-	sort.Strings(features)
+	slices.Sort(features)
 	return fmt.Errorf("faithful EPUB reconstruction is not implemented for: %s", strings.Join(features, ", "))
 }
 

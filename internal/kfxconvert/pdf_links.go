@@ -70,7 +70,7 @@ func addKFXPDFLinks(book *decodedBook, pages []Page, destination string) (int, e
 	sectionIDs := readingOrderSections(book.document)
 	builder := epubBuilder{book: book}
 	builder.indexSections(sectionIDs)
-	annotations := make(map[int][]model.AnnotationRenderer)
+	annotations := make(map[int][]model.AnnotationRenderer, len(geometry.links))
 	created := 0
 	for _, link := range geometry.links {
 		pageNumber := firstPage[link.sectionID]
@@ -153,7 +153,7 @@ func collectKFXPDFGeometry(book *decodedBook, pages []Page) collectedKFXPDFGeome
 	result := collectedKFXPDFGeometry{
 		sections: make(map[uint32]*kfxPDFGeometry), positions: make(map[uint32]kfxPDFPosition),
 	}
-	seenSections := make(map[uint32]bool)
+	seenSections := make(map[uint32]bool, len(pages))
 	for _, page := range pages {
 		sectionID := page.SectionID
 		if seenSections[sectionID] {

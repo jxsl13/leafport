@@ -2,6 +2,7 @@ package kfxdrm
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"slices"
 )
@@ -126,7 +127,7 @@ func (p *ionParser) parseValue(parentEnd int, fieldID uint64) (*ionValue, error)
 			return nil, fmt.Errorf("read Ion annotation length: %w", readErr)
 		}
 		if annotationBytes > uint64(valueEnd-p.pos) {
-			return nil, fmt.Errorf("ion annotation table exceeds wrapper")
+			return nil, errors.New("ion annotation table exceeds wrapper")
 		}
 		annotationEnd := p.pos + int(annotationBytes)
 		for p.pos < annotationEnd {
@@ -181,14 +182,14 @@ func (p *ionParser) readVarUInt(end int) (uint64, error) {
 		b := p.data[p.pos]
 		p.pos++
 		if value > (^uint64(0) >> 7) {
-			return 0, fmt.Errorf("VarUInt overflow")
+			return 0, errors.New("VarUInt overflow")
 		}
 		value = value<<7 | uint64(b&0x7f)
 		if b&0x80 != 0 {
 			return value, nil
 		}
 	}
-	return 0, fmt.Errorf("VarUInt is too long")
+	return 0, errors.New("VarUInt is too long")
 }
 
 func (v *ionValue) hasAnnotation(symbolID uint64) bool {

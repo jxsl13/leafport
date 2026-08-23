@@ -5,7 +5,7 @@ package runtimebridge
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"unsafe"
 
@@ -203,7 +203,7 @@ func resolveObjectiveCClass(runtime objectiveCRuntime, requirement objectiveCCla
 			}
 			names = append(names, name)
 		}
-		sort.Strings(names)
+		slices.Sort(names)
 		return 0, fmt.Errorf("multiple Objective-C classes satisfy the %s interface: %s",
 			requirement.role, strings.Join(names, ", "))
 	}
@@ -248,7 +248,7 @@ func resolveObjectiveCMethod(runtime objectiveCRuntime, class objc.Class, requir
 		for _, match := range matches {
 			names = append(names, match.name)
 		}
-		sort.Strings(names)
+		slices.Sort(names)
 		return 0, fmt.Errorf("Objective-C class %s has multiple compatible %s methods: %s",
 			className, requirement.role, strings.Join(names, ", "))
 	}

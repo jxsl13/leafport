@@ -3,12 +3,13 @@ package kfxconvert
 import (
 	"archive/zip"
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -71,7 +72,7 @@ func ExtractRawResources(path, destination string) ([]ExtractedResource, error) 
 		sources = append(sources, key)
 		dataBySource[key] = data
 	}
-	sort.Strings(sources)
+	slices.Sort(sources)
 	result := make([]ExtractedResource, 0, len(sources))
 	for index, source := range sources {
 		data := dataBySource[source]
@@ -118,7 +119,7 @@ func InspectFeatures(path string) (FeatureInventory, error) {
 }
 
 func (book *decodedBook) featureInventory() FeatureInventory {
-	entityTypes := make(map[uint32]bool)
+	entityTypes := make(map[uint32]bool, len(book.entities))
 	contentTypes := make(map[uint32]bool)
 	layouts := make(map[uint32]bool)
 	styleFields := make(map[uint32]bool)
@@ -179,7 +180,7 @@ func sortedFeatureIDs(values map[uint32]bool) []uint32 {
 	for value := range values {
 		result = append(result, value)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	slices.Sort(result)
 	return result
 }
 
@@ -300,6 +301,7 @@ func DumpNode(path string, target uint32, output io.Writer) error {
 	fmt.Fprintf(output, "indexed section: %d\n", builder.nodeSections[target])
 	needle := fmt.Sprintf(`id="kfx-node-%d"`, target)
 	var indexed, rendered []int
+	needleBytes := []byte(needle)
 	for index, sectionID := range sectionIDs {
 		probe := epubBuilder{book: book}
 		probe.indexSections([]uint32{sectionID})
@@ -313,7 +315,7 @@ func DumpNode(path string, target uint32, output io.Writer) error {
 			fmt.Fprintf(output, "section %d render error: %v\n", index+1, renderErr)
 			continue
 		}
-		if bytes.Contains(section.data, []byte(needle)) {
+		if bytes.Contains(section.data, needleBytes) {
 			rendered = append(rendered, index+1)
 		}
 	}
@@ -396,7 +398,9 @@ func formatIon(value *ionValue, local []string, depth int) string {
 		return annotation + open + strings.Join(parts, ", ") + close
 	case ionStruct:
 		fields := append([]ionField(nil), value.fields...)
-		sort.SliceStable(fields, func(i, j int) bool { return fields[i].id < fields[j].id })
+		slices.SortStableFunc(fields, func(left, right ionField) int {
+			return cmp.Compare(left.id, right.id)
+		})
 		parts := make([]string, 0, len(fields))
 		for index, field := range fields {
 			if index == 40 {

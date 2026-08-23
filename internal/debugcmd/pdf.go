@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
@@ -83,7 +83,7 @@ func runDebugPDF(arguments []string, stdout, stderr io.Writer) error {
 		for key := range targets.unresolvedKinds {
 			keys = append(keys, key)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		var details []string
 		for _, key := range keys {
 			details = append(details, fmt.Sprintf("%s=%d", key, targets.unresolvedKinds[key]))

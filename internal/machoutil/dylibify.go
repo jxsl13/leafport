@@ -4,6 +4,7 @@ package machoutil
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -20,7 +21,7 @@ const (
 // The input slice is modified in place.
 func Dylibify(data []byte) error {
 	if len(data) < 32 || binary.LittleEndian.Uint32(data) != mhMagic64 {
-		return fmt.Errorf("input is not a thin little-endian 64-bit Mach-O")
+		return errors.New("input is not a thin little-endian 64-bit Mach-O")
 	}
 	if got := binary.LittleEndian.Uint32(data[12:16]); got != mhExecute {
 		return fmt.Errorf("input file type is %d, not MH_EXECUTE", got)
@@ -29,7 +30,7 @@ func Dylibify(data []byte) error {
 	sizeofcmds := binary.LittleEndian.Uint32(data[20:24])
 	commandsEnd := uint64(32 + sizeofcmds)
 	if commandsEnd > uint64(len(data)) {
-		return fmt.Errorf("truncated load commands")
+		return errors.New("truncated load commands")
 	}
 
 	firstSection := uint64(len(data))
@@ -45,13 +46,13 @@ func Dylibify(data []byte) error {
 		}
 		if cmd == lcSegment64 {
 			if cmdsize < 72 {
-				return fmt.Errorf("truncated segment command")
+				return errors.New("truncated segment command")
 			}
 			nsects := binary.LittleEndian.Uint32(data[off+64 : off+68])
 			sectionOff := off + 72
 			for j := uint32(0); j < nsects; j++ {
 				if sectionOff+80 > off+uint64(cmdsize) {
-					return fmt.Errorf("truncated section table")
+					return errors.New("truncated section table")
 				}
 				fileOffset := binary.LittleEndian.Uint32(data[sectionOff+48 : sectionOff+52])
 				if fileOffset != 0 && uint64(fileOffset) < firstSection {
@@ -63,13 +64,13 @@ func Dylibify(data []byte) error {
 		off += uint64(cmdsize)
 	}
 	if off != commandsEnd {
-		return fmt.Errorf("load-command size mismatch")
+		return errors.New("load-command size mismatch")
 	}
 
 	name := []byte("LeafportRuntime.dylib\x00")
 	cmdsize := uint32((24 + len(name) + 7) &^ 7)
 	if commandsEnd+uint64(cmdsize) > firstSection {
-		return fmt.Errorf("not enough Mach-O header padding for LC_ID_DYLIB")
+		return errors.New("not enough Mach-O header padding for LC_ID_DYLIB")
 	}
 	command := data[commandsEnd : commandsEnd+uint64(cmdsize)]
 	clear(command)

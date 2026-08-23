@@ -2,6 +2,7 @@
 package library
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -76,7 +78,7 @@ func DiscoverRoots(home, override string) ([]Root, error) {
 		}
 		candidates = append(candidates, matches...)
 	}
-	seen := make(map[string]bool)
+	seen := make(map[string]bool, len(candidates))
 	var roots []Root
 	for _, candidate := range candidates {
 		absolute, err := filepath.Abs(candidate)
@@ -94,7 +96,9 @@ func DiscoverRoots(home, override string) ([]Root, error) {
 			MetadataDB:  metadataDatabaseForRoot(absolute),
 		})
 	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].Path < roots[j].Path })
+	slices.SortFunc(roots, func(left, right Root) int {
+		return cmp.Compare(left.Path, right.Path)
+	})
 	if len(roots) == 0 {
 		return nil, errors.New("no local reader library directory was found")
 	}
@@ -287,7 +291,7 @@ func isReaderLibraryPath(home, path string) bool {
 	} {
 		if relative, err := filepath.Rel(parent, path); err == nil && relative != "." &&
 			!strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			container := strings.ToLower(strings.Split(relative, string(filepath.Separator))[0])
+			container := strings.ToLower(strings.SplitN(relative, string(filepath.Separator), 2)[0])
 			return strings.Contains(container, "amazon") || strings.Contains(container, "kindle") ||
 				strings.Contains(container, "lassen")
 		}
@@ -299,8 +303,7 @@ func isReaderLibraryPath(home, path string) bool {
 
 func preferencesForRoot(home, root, fallback string) string {
 	containers := filepath.Join(home, "Library/Containers") + string(filepath.Separator)
-	if strings.HasPrefix(root, containers) {
-		relative := strings.TrimPrefix(root, containers)
+	if relative, found := strings.CutPrefix(root, containers); found {
 		parts := strings.Split(relative, string(filepath.Separator))
 		if len(parts) > 0 && parts[0] != "" {
 			candidate := filepath.Join(containers, parts[0], "Data/Library/Preferences", parts[0]+".plist")
@@ -392,7 +395,7 @@ func discoverBooksInRoot(ctx context.Context, root Root) ([]Book, []error, error
 }
 
 func inferBookID(relative, directory string) string {
-	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+	for part := range strings.SplitSeq(relative, string(filepath.Separator)) {
 		if isASIN(part) {
 			return strings.ToUpper(part)
 		}

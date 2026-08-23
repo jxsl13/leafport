@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // PrivacyOptions enables removal of personal information during
@@ -180,7 +181,7 @@ func applyPrivacy(book *decodedBook, options PrivacyOptions) (PrivacyResult, err
 
 func addAutomaticValue(values map[string]struct{}, value string) {
 	value = strings.TrimSpace(value)
-	if len([]rune(value)) < 3 || len(value) > 512 {
+	if utf8.RuneCountInString(value) < 3 || len(value) > 512 {
 		return
 	}
 	values[value] = struct{}{}

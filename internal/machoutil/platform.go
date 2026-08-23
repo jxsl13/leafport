@@ -2,6 +2,7 @@ package machoutil
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -15,12 +16,12 @@ const (
 // load Kindle's Mac Catalyst runtime into a platform-compatible process.
 func SetMacCatalystPlatform(data []byte) error {
 	if len(data) < 32 || binary.LittleEndian.Uint32(data[:4]) != mhMagic64 {
-		return fmt.Errorf("input is not a thin little-endian 64-bit Mach-O")
+		return errors.New("input is not a thin little-endian 64-bit Mach-O")
 	}
 	ncmds := binary.LittleEndian.Uint32(data[16:20])
 	commandsEnd := uint64(32) + uint64(binary.LittleEndian.Uint32(data[20:24]))
 	if commandsEnd > uint64(len(data)) {
-		return fmt.Errorf("truncated Mach-O load commands")
+		return errors.New("truncated Mach-O load commands")
 	}
 	offset := uint64(32)
 	found := false
@@ -35,7 +36,7 @@ func SetMacCatalystPlatform(data []byte) error {
 		}
 		if command == lcBuildVersion {
 			if commandSize < 24 {
-				return fmt.Errorf("truncated LC_BUILD_VERSION")
+				return errors.New("truncated LC_BUILD_VERSION")
 			}
 			binary.LittleEndian.PutUint32(data[offset+8:offset+12], platformMacCatalyst)
 			// Match the minimum used by the previously verified bridge.
@@ -45,7 +46,7 @@ func SetMacCatalystPlatform(data []byte) error {
 		offset += uint64(commandSize)
 	}
 	if !found {
-		return fmt.Errorf("Mach-O has no LC_BUILD_VERSION command")
+		return errors.New("Mach-O has no LC_BUILD_VERSION command")
 	}
 	return nil
 }
