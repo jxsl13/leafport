@@ -145,18 +145,19 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		}
 	}
 	outputs := library.PlanOutputs(books, target)
-	fmt.Fprintf(streams.Stdout, "Selected %d book(s); target: %s\n", len(outputs), target)
+	fmt.Fprintf(streams.Stdout, "Exporting %d book(s)\nTarget: %s\n", len(outputs), target)
 	debugRoot := ""
 	if config.Debug && len(outputs) != 0 {
 		debugRoot, err = prepareDebugRoot(target, time.Now())
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(streams.Stdout, "Debug artifacts: %s\n", debugRoot)
+		fmt.Fprintf(streams.Stdout, "Debug: %s\n", debugRoot)
 		if privacy.DetectPersonal || len(privacy.Patterns) != 0 {
 			fmt.Fprintln(streams.Stderr, "Warning: --debug artifacts contain the original encrypted and decrypted data and are not privacy-cleaned.")
 		}
 	}
+	fmt.Fprintln(streams.Stdout)
 	succeeded := 0
 	skipped := 0
 	workRoot := ""
@@ -168,23 +169,38 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		}
 	}()
 	var failures []error
-	accountSecrets := preflightAccountSecrets(ctx, config, streams, outputs)
+	accountSecrets := preflightAccountSecrets(ctx, config, outputs)
+	for _, notice := range accountSecrets.notices {
+		fmt.Fprintln(streams.Stdout, notice)
+	}
+	if len(accountSecrets.notices) != 0 {
+		fmt.Fprintln(streams.Stdout)
+	}
+	reporter := batchReporter{output: streams.Stdout}
 	for index, output := range outputs {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			failures = append(failures, ctxErr)
 			break
 		}
+		reporter.begin(index+1, len(outputs), library.DisplayTitle(output.Book), output.Book.ID)
+		recordFailure := func(cause error) {
+			failures = append(failures, fmt.Errorf("%s (%s): %w",
+				library.DisplayTitle(output.Book), output.Book.ID, cause))
+			reporter.field("Status", "failed")
+			reporter.field("Reason", cause.Error())
+		}
 		existing, statErr := existingPublication(output.Path)
 		if statErr != nil {
-			failures = append(failures, fmt.Errorf("inspect output for %s: %w", output.Book.ID, statErr))
+			recordFailure(fmt.Errorf("inspect output: %w", statErr))
 			continue
 		}
 		if existing != "" && !config.Debug {
 			if privacy.DetectPersonal || len(privacy.Patterns) != 0 {
-				failures = append(failures, fmt.Errorf("privacy cleanup was not applied to existing output %s; move it away and run again", existing))
+				recordFailure(fmt.Errorf("privacy cleanup was not applied to existing output %s; move it away and run again", existing))
 				continue
 			}
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Skipped existing: %s\n", index+1, len(outputs), existing)
+			reporter.field("Status", "skipped (already exists)")
+			reporter.field("Output", existing)
 			skipped++
 			continue
 		}
@@ -192,11 +208,10 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		if config.Debug {
 			debugBookRoot = filepath.Join(debugRoot, library.SafeName(output.Book.ID))
 			if debugErr := preserveEncryptedBundle(output.Book.Path, filepath.Join(debugBookRoot, "encrypted")); debugErr != nil {
-				failures = append(failures, fmt.Errorf("preserve encrypted debug bundle for %s: %w", output.Book.ID, debugErr))
+				recordFailure(fmt.Errorf("preserve encrypted debug bundle: %w", debugErr))
 				continue
 			}
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Preserved encrypted source: %s\n",
-				index+1, len(outputs), filepath.Join(debugBookRoot, "encrypted"))
+			reporter.field("Encrypted", filepath.Join(debugBookRoot, "encrypted"))
 		}
 		archivePath := output.Path + ".kfx-zip"
 		var archiveData []byte
@@ -204,20 +219,17 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		archiveInfo, archiveErr := os.Stat(archivePath)
 		switch {
 		case archiveErr == nil && archiveInfo.IsDir():
-			failures = append(failures, fmt.Errorf("intermediate archive is a directory: %s", archivePath))
+			recordFailure(fmt.Errorf("intermediate archive is a directory: %s", archivePath))
 			continue
 		case archiveErr == nil:
 			archiveSize = archiveInfo.Size()
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Converting existing decrypted archive for %s — %s\n",
-				index+1, len(outputs), output.Book.ID, library.DisplayTitle(output.Book))
+			reporter.field("Action", "converting existing decrypted archive")
 		case !errors.Is(archiveErr, os.ErrNotExist):
-			failures = append(failures, fmt.Errorf("inspect intermediate archive for %s: %w", output.Book.ID, archiveErr))
+			recordFailure(fmt.Errorf("inspect intermediate archive: %w", archiveErr))
 			continue
 		default:
 			if block := accountSecrets.blocked[output.Book.ID]; block != nil {
-				failure := fmt.Errorf("%s (%s): %w",
-					library.DisplayTitle(output.Book), output.Book.ID, block)
-				failures = append(failures, failure)
+				recordFailure(block)
 				continue
 			}
 			if workRoot == "" {
@@ -229,29 +241,25 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 					return err
 				}
 			}
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Decrypting %s — %s\n",
-				index+1, len(outputs), output.Book.ID, library.DisplayTitle(output.Book))
+			reporter.field("Action", "decrypting and reconstructing publication")
 			accountSecret := config.AccountSecret
 			if accountSecret == "" {
 				accountSecret = accountSecrets.byPreferences[output.Book.Preferences]
 			}
 			exportConfig := exporter.Config{
 				AppPath: config.AppPath, AccountSecret: accountSecret,
-				Stdin: streams.Stdin, Stdout: streams.Stdout, Stderr: streams.Stderr,
+				Stdin: streams.Stdin, Stdout: io.Discard, Stderr: streams.Stderr,
 			}
 			archive, exportErr := exporter.Export(ctx, exportConfig, output, workRoot)
 			if exportErr != nil {
-				failure := fmt.Errorf("%s (%s): %w",
-					library.DisplayTitle(output.Book), output.Book.ID, exportErr)
-				failures = append(failures, failure)
+				recordFailure(exportErr)
 				continue
 			}
 			archivePath = archive.Path
 			archiveData = archive.Data
 			archiveSize = archive.Size
 			if archive.Path != "" {
-				fmt.Fprintf(streams.Stdout, "[%d/%d] Archive exceeded 1 GiB; using private temporary storage\n",
-					index+1, len(outputs))
+				reporter.field("Storage", "archive exceeded 1 GiB; using private temporary storage")
 			}
 		}
 		if config.Debug {
@@ -259,19 +267,18 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 			if debugErr := preserveDecryptedArchive(debugArchive, exporter.Archive{
 				Data: archiveData, Path: archivePath, Size: archiveSize,
 			}); debugErr != nil {
-				failures = append(failures, fmt.Errorf("preserve decrypted debug archive for %s: %w", output.Book.ID, debugErr))
+				recordFailure(fmt.Errorf("preserve decrypted debug archive: %w", debugErr))
 				continue
 			}
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Preserved decrypted KFX: %s\n",
-				index+1, len(outputs), debugArchive)
+			reporter.field("Decrypted", debugArchive)
 		}
 		if existing != "" {
 			if privacy.DetectPersonal || len(privacy.Patterns) != 0 {
-				failures = append(failures, fmt.Errorf("privacy cleanup was not applied to existing output %s; move it away and run again", existing))
+				recordFailure(fmt.Errorf("privacy cleanup was not applied to existing output %s; move it away and run again", existing))
 				continue
 			}
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Skipped existing final result after debug capture: %s\n",
-				index+1, len(outputs), existing)
+			reporter.field("Status", "skipped (debug artifacts refreshed)")
+			reporter.field("Output", existing)
 			skipped++
 			continue
 		}
@@ -287,37 +294,31 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 			conversion, convertErr = kfxconvert.ConvertWithOptions(archivePath, output.Path, metadata, options)
 		}
 		if convertErr != nil {
-			failure := fmt.Errorf("%s (%s): %w",
-				library.DisplayTitle(output.Book), output.Book.ID, convertErr)
-			failures = append(failures, failure)
+			recordFailure(convertErr)
 			continue
 		}
+		reporter.field("Status", "completed")
+		reporter.field("Output", conversion.Path)
 		switch conversion.Format {
 		case "PDF":
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Completed PDF: %s (%d pages)\n",
-				index+1, len(outputs), conversion.Path, conversion.Pages)
+			reporter.field("Format", fmt.Sprintf("PDF · %d pages", conversion.Pages))
 			if conversion.BrokenLinksRemoved != 0 {
-				fmt.Fprintf(streams.Stdout, "[%d/%d] Removed %d nonfunctional link annotation(s) inherited from embedded PDF resources\n",
-					index+1, len(outputs), conversion.BrokenLinksRemoved)
+				reporter.field("Links", fmt.Sprintf("removed %d nonfunctional inherited annotation(s)", conversion.BrokenLinksRemoved))
 			}
 		case "EPUB":
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Completed EPUB: %s (%d sections, %d images, %d media, %d fonts)\n",
-				index+1, len(outputs), conversion.Path, conversion.Sections, conversion.Images, conversion.Media, conversion.Fonts)
+			reporter.field("Format", fmt.Sprintf("EPUB · %d sections · %d images · %d media · %d fonts",
+				conversion.Sections, conversion.Images, conversion.Media, conversion.Fonts))
 		case "CBZ":
-			fmt.Fprintf(streams.Stdout, "[%d/%d] Completed CBZ: %s (%d pages)\n",
-				index+1, len(outputs), conversion.Path, conversion.Pages)
+			reporter.field("Format", fmt.Sprintf("CBZ · %d pages", conversion.Pages))
 		}
 		if conversion.Privacy.Enabled {
-			fmt.Fprintf(streams.Stdout,
-				"[%d/%d] Privacy cleanup: %d owner value(s) detected, %d private metadata field(s) removed\n",
-				index+1, len(outputs), conversion.Privacy.AutomaticValues, conversion.Privacy.MetadataFields)
+			reporter.field("Privacy", fmt.Sprintf("%d owner value(s) detected · %d private metadata field(s) removed",
+				conversion.Privacy.AutomaticValues, conversion.Privacy.MetadataFields))
 		}
 		succeeded++
 	}
-	for _, failure := range failures {
-		fmt.Fprintf(streams.Stderr, "Failed: %v\n", failure)
-	}
-	fmt.Fprintf(streams.Stdout, "Batch complete: %d succeeded, %d skipped, %d failed\n",
+	reporter.finish()
+	fmt.Fprintf(streams.Stdout, "Summary: %d completed · %d skipped · %d failed\n",
 		succeeded, skipped, len(failures))
 	if joined := errors.Join(failures...); joined != nil {
 		return reportedError{err: joined}
@@ -328,9 +329,10 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 type accountSecretPreflight struct {
 	blocked       map[string]error
 	byPreferences map[string]string
+	notices       []string
 }
 
-func preflightAccountSecrets(ctx context.Context, config Config, streams Streams, outputs []library.Output) accountSecretPreflight {
+func preflightAccountSecrets(ctx context.Context, config Config, outputs []library.Output) accountSecretPreflight {
 	result := accountSecretPreflight{
 		blocked:       make(map[string]error),
 		byPreferences: make(map[string]string),
@@ -379,29 +381,29 @@ func preflightAccountSecrets(ctx context.Context, config Config, streams Streams
 			}
 			if discovery.err == nil && discovery.secret != "" {
 				result.byPreferences[preferences] = discovery.secret
-				fmt.Fprintf(streams.Stdout,
-					"Account-secret preflight: verified a reader-owned credential against its stored fingerprint (%d file(s), %d candidate(s)).\n",
-					discovery.report.Files, discovery.report.Candidates)
+				result.notices = append(result.notices, fmt.Sprintf(
+					"Credential check: verified a reader-owned account secret (%d files checked).",
+					discovery.report.Files))
 				continue
 			}
 		}
-		detail := "voucher requires the raw 40-character account secret; automatic retrieval is unavailable because the signed reader's Data Protection Keychain access group cannot be inherited by Leafport"
+		detail := "account secret required; no verified raw credential is available"
 		if err != nil {
-			detail += "; reader registration: " + err.Error()
+			detail += "; reader registration unavailable: " + err.Error()
 		}
 		if credentials.HashedAccountSecret != "" {
-			detail += "; preferences contain only the incompatible hash"
 			if discovery.err != nil {
-				detail += "; reader-owned storage scan failed: " + discovery.err.Error()
+				detail += "; local credential scan failed: " + discovery.err.Error()
 			} else {
-				detail += fmt.Sprintf("; no matching raw value in %d normally readable file(s)", discovery.report.Files)
+				detail += fmt.Sprintf(" (%d reader files checked)", discovery.report.Files)
 			}
 		}
-		detail += "; LEAFPORT_ACCOUNT_SECRET is usable only if the raw value was obtained independently"
+		detail += "; run \"leafport doctor\" for details"
 		for _, book := range group {
 			result.blocked[book.ID] = errors.New(detail)
 		}
-		fmt.Fprintf(streams.Stderr, "Account-secret preflight: %d selected book(s) require a credential unavailable to this process.\n", len(group))
+		result.notices = append(result.notices, fmt.Sprintf(
+			"Credential check: %d selected book(s) require an unavailable account secret.", len(group)))
 	}
 	return result
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"leafport/internal/exporter"
 	"leafport/internal/library"
@@ -45,6 +46,22 @@ func TestRunBatchSkipsExistingWithoutWorkDirectory(t *testing.T) {
 	if len(matches) != 0 {
 		t.Fatalf("unexpected work directories: %v", matches)
 	}
+	wantParts := []string{
+		"[1/1] Existing Book",
+		"        ID       B000000001",
+		"        Status   skipped (already exists)",
+		"        Output   " + string(filepath.Separator),
+		"Existing Book.epub",
+		"Summary: 0 completed · 1 skipped · 0 failed",
+	}
+	for _, want := range wantParts {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout does not contain %q:\n%s", want, stdout.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "Skipped existing:") {
+		t.Fatalf("stdout contains legacy one-line output: %q", stdout.String())
+	}
 }
 
 func TestRunBatchDoesNotAcceptExistingOutputAsPrivacyClean(t *testing.T) {
@@ -58,8 +75,46 @@ func TestRunBatchDoesNotAcceptExistingOutputAsPrivacyClean(t *testing.T) {
 	err := runBatch(context.Background(), Config{RedactPersonal: true}, Streams{
 		Stdout: &stdout, Stderr: &stderr,
 	}, target, []library.Book{book})
-	if err == nil || !strings.Contains(stderr.String(), "privacy cleanup was not applied") {
-		t.Fatalf("err = %v, stderr = %q", err, stderr.String())
+	if err == nil || !strings.Contains(stdout.String(), "privacy cleanup was not applied") {
+		t.Fatalf("err = %v, stdout = %q", err, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "        Status   failed") ||
+		!strings.Contains(stdout.String(), "        Reason   privacy cleanup") {
+		t.Fatalf("failure is not structured as a book block: %q", stdout.String())
+	}
+}
+
+func TestBatchReporterWrapsLongBookInformation(t *testing.T) {
+	var output bytes.Buffer
+	reporter := batchReporter{output: &output}
+	reporter.begin(12, 13,
+		"Artificial Intelligence: A Very Long Book Title That Must Stay Visually Separate From Its Details Even On A Narrow Terminal",
+		"B012345678")
+	reporter.field("Status", "failed")
+	reporter.field("Reason", "account secret required; no verified raw credential is available; "+
+		"this deliberately long explanation must continue on an aligned line instead of becoming one unwieldy status line")
+	reporter.field("Output", "/Users/example/Documents/exports/"+strings.Repeat("very-long-directory-name/", 5)+"book.epub")
+	reporter.finish()
+
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	for _, line := range lines {
+		if width := utf8.RuneCountInString(line); width > batchOutputWidth {
+			t.Errorf("line has %d runes, want <= %d: %q", width, batchOutputWidth, line)
+		}
+	}
+	if !strings.HasPrefix(lines[0], "[12/13] Artificial Intelligence") {
+		t.Fatalf("book header = %q", lines[0])
+	}
+	wantParts := []string{
+		"\n        ID       B012345678\n",
+		"\n        Status   failed\n",
+		"\n        Reason   account secret required",
+		"\n                 deliberately long explanation",
+	}
+	for _, want := range wantParts {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("output does not contain %q:\n%s", want, output.String())
+		}
 	}
 }
 
