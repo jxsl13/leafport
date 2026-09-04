@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"hash/crc32"
 	"html"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"net/url"
 	"os"
@@ -16,6 +19,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	xdraw "golang.org/x/image/draw"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
 )
 
 // Metadata supplies library metadata when a KFX publication omits it.
@@ -133,11 +141,19 @@ func convertBookToEPUB(book *decodedBook, destination string, fallback Metadata)
 		}
 		sections = append(sections, section)
 	}
-	// A cover is a publication resource even when it does not occur in the
-	// reading-order storylines. Keep a usable metadata cover in the manifest.
-	builder.addMetadataCover()
 	if len(sections) == 0 {
 		return result, errors.New("KFX reading order produced no EPUB sections")
+	}
+	// Amazon consumes the cover-image metadata itself and suppresses cover
+	// HTML. If KFX omits usable metadata, derive the cover from the first
+	// non-empty spine page without adding a duplicate content document.
+	cover, coverSection, err := builder.ensureMetadataCover(sections, metadata)
+	if err != nil {
+		return result, err
+	}
+	if coverSection > 0 {
+		selected := sections[coverSection]
+		sections = append([]epubSection{selected}, append(sections[:coverSection], sections[coverSection+1:]...)...)
 	}
 
 	file, err := os.OpenFile(destination, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
@@ -206,12 +222,206 @@ func convertBookToEPUB(book *decodedBook, destination string, fallback Metadata)
 	if err = validateEPUB(destination, len(sections), imageCount, mediaCount, len(builder.fontAssets)); err != nil {
 		return result, err
 	}
+	if cover != nil {
+		if _, err = ValidateEPUBFile(destination); err != nil {
+			return result, err
+		}
+	}
 	result.Sections = len(sections)
 	result.Images = imageCount
 	result.Media = mediaCount
 	result.Fonts = len(builder.fontAssets)
 	complete = true
 	return result, nil
+}
+
+func epubSectionReferencesAsset(section epubSection, assetPath string) bool {
+	return bytes.Contains(section.data, []byte(`src="../`+assetPath+`"`)) ||
+		bytes.Contains(section.data, []byte(`href="../`+assetPath+`"`))
+}
+
+func (builder *epubBuilder) ensureMetadataCover(sections []epubSection, metadata Metadata) (*epubAsset, int, error) {
+	builder.addMetadataCover()
+	for _, asset := range builder.assetOrder {
+		if asset.coverImage {
+			width, height, err := epubCoverImageDimensions(asset.mediaType, asset.data)
+			if err != nil {
+				return nil, -1, err
+			}
+			if kindleCoverDimensions(width, height) {
+				for index, section := range sections {
+					if epubSectionReferencesAsset(section, asset.path) {
+						return asset, index, nil
+					}
+				}
+				return asset, -1, nil
+			}
+			asset.coverImage = false
+		}
+	}
+	sectionIndex, pageText, err := firstNonemptyEPUBSection(sections)
+	if err != nil {
+		return nil, -1, err
+	}
+	if sectionIndex < 0 {
+		return nil, -1, errors.New("KFX publication has no non-empty spine page for a fallback cover")
+	}
+	document, err := inspectEPUBXML(bytes.NewReader(sections[sectionIndex].data))
+	if err != nil {
+		return nil, -1, err
+	}
+	for _, reference := range document.hrefs {
+		resolved, resolveErr := resolveEPUBReference(sections[sectionIndex].path, reference)
+		if resolveErr != nil {
+			continue
+		}
+		for _, asset := range builder.assetOrder {
+			if asset.image && asset.path == resolved {
+				width, height, dimensionErr := epubCoverImageDimensions(asset.mediaType, asset.data)
+				if dimensionErr != nil {
+					return nil, -1, dimensionErr
+				}
+				if kindleCoverDimensions(width, height) {
+					asset.coverImage = true
+					return asset, sectionIndex, nil
+				}
+			}
+		}
+	}
+	data, err := fallbackPageCoverJPEG(metadata.Title, pageText)
+	if err != nil {
+		return nil, -1, err
+	}
+	path := "images/leafport-fallback-cover.jpg"
+	used := make(map[string]bool, len(builder.assetOrder))
+	for _, asset := range builder.assetOrder {
+		used[asset.path] = true
+	}
+	for suffix := 2; used[path]; suffix++ {
+		path = "images/leafport-fallback-cover-" + strconv.Itoa(suffix) + ".jpg"
+	}
+	asset := &epubAsset{
+		manifestID: "leafport-fallback-cover", path: path, mediaType: "image/jpeg",
+		data: data, image: true, coverImage: true,
+	}
+	builder.assetOrder = append(builder.assetOrder, asset)
+	return asset, sectionIndex, nil
+}
+
+func epubCoverImageDimensions(mediaType string, data []byte) (int, int, error) {
+	if mediaType == "image/svg+xml" {
+		return svgImageDimensions(data)
+	}
+	configuration, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0, fmt.Errorf("inspect EPUB cover image: %w", err)
+	}
+	if err := validateRasterDimensions(configuration.Width, configuration.Height, "EPUB cover"); err != nil {
+		return 0, 0, err
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0, fmt.Errorf("decode EPUB cover image: %w", err)
+	}
+	return decoded.Bounds().Dx(), decoded.Bounds().Dy(), nil
+}
+
+func firstNonemptyEPUBSection(sections []epubSection) (int, string, error) {
+	for index, section := range sections {
+		decoder := xml.NewDecoder(bytes.NewReader(section.data))
+		inBody, visual := false, false
+		var textContent strings.Builder
+		for {
+			token, err := decoder.Token()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return -1, "", fmt.Errorf("inspect fallback cover page %s: %w", section.path, err)
+			}
+			switch value := token.(type) {
+			case xml.StartElement:
+				if value.Name.Local == "body" {
+					inBody = true
+				}
+				if inBody {
+					switch value.Name.Local {
+					case "img", "svg", "math", "table", "audio", "video", "canvas", "object":
+						visual = true
+					}
+				}
+			case xml.EndElement:
+				if value.Name.Local == "body" {
+					inBody = false
+				}
+			case xml.CharData:
+				if inBody {
+					textContent.Write(value)
+					textContent.WriteByte(' ')
+				}
+			}
+		}
+		text := strings.Join(strings.Fields(textContent.String()), " ")
+		if visual || text != "" {
+			return index, text, nil
+		}
+	}
+	return -1, "", nil
+}
+
+func fallbackPageCoverJPEG(title, pageText string) ([]byte, error) {
+	preview := strings.TrimSpace(title)
+	if strings.TrimSpace(pageText) != "" {
+		preview += "\n\n" + strings.TrimSpace(pageText)
+	}
+	lines := wrapCoverText(preview, 70, 38)
+	small := image.NewRGBA(image.Rect(0, 0, 600, 800))
+	xdraw.Draw(small, small.Bounds(), &image.Uniform{C: color.White}, image.Point{}, xdraw.Src)
+	drawer := font.Drawer{Dst: small, Src: image.NewUniform(color.RGBA{R: 30, G: 34, B: 40, A: 255}), Face: basicfont.Face7x13}
+	y := 100
+	for _, line := range lines {
+		drawer.Dot = fixed.P(40, y)
+		drawer.DrawString(line)
+		y += 18
+	}
+	cover := image.NewRGBA(image.Rect(0, 0, 1200, 1600))
+	xdraw.NearestNeighbor.Scale(cover, cover.Bounds(), small, small.Bounds(), xdraw.Src, nil)
+	var output bytes.Buffer
+	if err := jpeg.Encode(&output, cover, &jpeg.Options{Quality: 90}); err != nil {
+		return nil, fmt.Errorf("generate fallback cover from first non-empty page: %w", err)
+	}
+	return output.Bytes(), nil
+}
+
+func wrapCoverText(value string, width, maximum int) []string {
+	var lines []string
+	for _, paragraph := range strings.Split(value, "\n") {
+		words := strings.Fields(paragraph)
+		line := ""
+		for _, word := range words {
+			if len(line)+len(word)+1 > width && line != "" {
+				lines = append(lines, line)
+				line = ""
+			}
+			if line != "" {
+				line += " "
+			}
+			line += word
+			if len(lines) >= maximum {
+				return lines
+			}
+		}
+		if line != "" {
+			lines = append(lines, line)
+		}
+		if len(lines) >= maximum {
+			return lines[:maximum]
+		}
+		if len(words) == 0 && len(lines) != 0 {
+			lines = append(lines, "")
+		}
+	}
+	return lines
 }
 
 func (book *decodedBook) publicationMetadata(fallback Metadata) Metadata {

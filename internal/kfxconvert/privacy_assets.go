@@ -165,7 +165,7 @@ func stripWebPMetadata(data []byte) ([]byte, error) {
 		offset = end
 	}
 	result := output.Bytes()
-	if len(result)-8 > int(^uint32(0)) {
+	if uint64(len(result)-8) > uint64(^uint32(0)) {
 		return nil, errors.New("WebP exceeds RIFF size limit")
 	}
 	binary.LittleEndian.PutUint32(result[4:8], uint32(len(result)-8))
@@ -289,7 +289,7 @@ func stripWAVMetadata(data []byte) ([]byte, error) {
 		offset = end
 	}
 	result := output.Bytes()
-	if len(result)-8 > int(^uint32(0)) {
+	if uint64(len(result)-8) > uint64(^uint32(0)) {
 		return nil, errors.New("WAV exceeds RIFF size limit")
 	}
 	binary.LittleEndian.PutUint32(result[4:8], uint32(len(result)-8))

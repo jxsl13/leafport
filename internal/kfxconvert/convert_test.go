@@ -2,6 +2,33 @@ package kfxconvert
 
 import "testing"
 
+func TestRequestedFormatRoutesEverySupportedOutput(t *testing.T) {
+	pages := []Page{{Format: 285, Data: []byte("image")}}
+	for requested, expected := range map[string]string{
+		"pdf": "PDF", "epub": "EPUB-FXL", "cbz": "CBZ", "comic-epub": "EPUB-COMIC",
+	} {
+		decision, err := requestedFormat(nil, pages, requested)
+		if err != nil {
+			t.Fatalf("requested %s: %v", requested, err)
+		}
+		if decision.Format != expected {
+			t.Fatalf("requested %s routed to %s, want %s", requested, decision.Format, expected)
+		}
+	}
+	decision, err := requestedFormat(nil, nil, "epub")
+	if err != nil || decision.Format != "EPUB" {
+		t.Fatalf("reflowable EPUB route = %+v, %v", decision, err)
+	}
+	for _, requested := range []string{"pdf", "cbz", "comic-epub"} {
+		if _, err := requestedFormat(nil, nil, requested); err == nil {
+			t.Fatalf("reflowable publication accepted incompatible %s output", requested)
+		}
+	}
+	if _, err := requestedFormat(nil, pages, "unknown"); err == nil {
+		t.Fatal("unknown output format was accepted")
+	}
+}
+
 func TestChooseFormatPreservesPDFBackedPublication(t *testing.T) {
 	decision := chooseFormat(nil, []Page{
 		{Format: kfxPDFFormat, Data: []byte("%PDF-1.7\nfirst")},

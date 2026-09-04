@@ -25,6 +25,22 @@ func TestPrepareTargetDirectory(t *testing.T) {
 	}
 }
 
+func TestExplicitFormatOnlyChecksItsOwnDestination(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "Book")
+	if err := os.WriteFile(base+".epub", []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if existing, err := existingPublication(base, "pdf"); err != nil || existing != "" {
+		t.Fatalf("PDF existing result = %q, err = %v", existing, err)
+	}
+	if existing, err := existingPublication(base, "epub"); err != nil || existing != base+".epub" {
+		t.Fatalf("EPUB existing result = %q, err = %v", existing, err)
+	}
+	if existing, err := existingPublication(base, "auto"); err != nil || existing != base+".epub" {
+		t.Fatalf("automatic existing result = %q, err = %v", existing, err)
+	}
+}
+
 func TestRunBatchSkipsExistingWithoutWorkDirectory(t *testing.T) {
 	target := t.TempDir()
 	book := library.Book{ID: "B000000001", Title: "Existing Book"}

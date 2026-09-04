@@ -24,6 +24,7 @@ type Config struct {
 	AppPath         string
 	Library         string
 	Match           string
+	Format          string
 	Output          string
 	Target          string
 	AccountSecret   string
@@ -156,7 +157,7 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		}
 	}
 	outputs := library.PlanOutputs(books, target)
-	outputStates := inspectBatchOutputs(outputs)
+	outputStates := inspectBatchOutputs(outputs, config.Format)
 	fmt.Fprintf(streams.Stdout, "Exporting %d book(s)\nTarget: %s\n", len(outputs), target)
 	debugRoot := ""
 	if config.Debug && len(outputs) != 0 {
@@ -314,7 +315,7 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 		}
 		var conversion kfxconvert.ConversionResult
 		var convertErr error
-		options := kfxconvert.ConversionOptions{Privacy: privacy}
+		options := kfxconvert.ConversionOptions{Privacy: privacy, Format: config.Format}
 		if len(archiveData) != 0 {
 			conversion, convertErr = kfxconvert.ConvertBytesWithOptions(archiveData, output.Path, metadata, options)
 		} else {
@@ -337,6 +338,8 @@ func runBatch(ctx context.Context, config Config, streams Streams, target string
 				conversion.Sections, conversion.Images, conversion.Media, conversion.Fonts))
 		case "CBZ":
 			reporter.field("Format", fmt.Sprintf("CBZ · %d pages", conversion.Pages))
+		case "EPUB-COMIC", "EPUB-FXL":
+			reporter.field("Format", fmt.Sprintf("%s · %d pages", conversion.Format, conversion.Pages))
 		}
 		if conversion.Privacy.Enabled {
 			reporter.field("Privacy", fmt.Sprintf("%d owner value(s) detected · %d private metadata field(s) removed",
@@ -369,11 +372,11 @@ type batchOutputState struct {
 	archiveErr    error
 }
 
-func inspectBatchOutputs(outputs []library.Output) []batchOutputState {
+func inspectBatchOutputs(outputs []library.Output, format string) []batchOutputState {
 	states := make([]batchOutputState, len(outputs))
 	for index, output := range outputs {
 		state := batchOutputState{archivePath: output.Path + ".kfx-zip"}
-		state.existing, state.existingErr = existingPublication(output.Path)
+		state.existing, state.existingErr = existingPublication(output.Path, format)
 		info, err := os.Stat(state.archivePath)
 		switch {
 		case err == nil && info.IsDir():
@@ -473,8 +476,17 @@ func preflightAccountSecrets(ctx context.Context, config Config, outputs []libra
 	return result
 }
 
-func existingPublication(base string) (string, error) {
-	for _, extension := range []string{".pdf", ".epub", ".cbz"} {
+func existingPublication(base, format string) (string, error) {
+	extensions := []string{".pdf", ".epub", ".cbz"}
+	switch format {
+	case "pdf":
+		extensions = []string{".pdf"}
+	case "epub", "comic-epub":
+		extensions = []string{".epub"}
+	case "cbz":
+		extensions = []string{".cbz"}
+	}
+	for _, extension := range extensions {
 		path := base + extension
 		info, err := os.Stat(path)
 		switch {

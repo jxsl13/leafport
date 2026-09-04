@@ -169,7 +169,9 @@ func TestConvertPluginBookPackagesAndValidatesMedia(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Sections != 1 || result.Images != 0 || result.Media != 1 || result.Fonts != 0 {
+	// A publication without a declared cover gets a cover generated from its
+	// first non-empty spine page, without a duplicate HTML cover document.
+	if result.Sections != 1 || result.Images != 1 || result.Media != 1 || result.Fonts != 0 {
 		t.Fatalf("EPUB result = %+v", result)
 	}
 	archive, err := zip.OpenReader(destination)

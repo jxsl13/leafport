@@ -23,16 +23,15 @@ github.com/clipperhouse/uax29/v2/graphemes
 # github.com/dustin/go-humanize v1.0.1
 ## explicit; go 1.16
 github.com/dustin/go-humanize
-# github.com/ebitengine/purego v0.10.2
-## explicit; go 1.18
+# github.com/ebitengine/purego v0.11.0
+## explicit; go 1.25.0
 github.com/ebitengine/purego
 github.com/ebitengine/purego/internal/cgo
 github.com/ebitengine/purego/internal/fakecgo
 github.com/ebitengine/purego/internal/strings
-github.com/ebitengine/purego/internal/xreflect
 github.com/ebitengine/purego/objc
-# github.com/google/go-cmp v0.6.0
-## explicit; go 1.13
+# github.com/google/go-cmp v0.7.0
+## explicit; go 1.21
 # github.com/google/uuid v1.6.0
 ## explicit
 github.com/google/uuid
@@ -42,7 +41,7 @@ github.com/hhrutter/tiff
 # github.com/mattn/go-isatty v0.0.24
 ## explicit; go 1.20
 github.com/mattn/go-isatty
-# github.com/mattn/go-runewidth v0.0.28
+# github.com/mattn/go-runewidth v0.0.29
 ## explicit; go 1.23
 github.com/mattn/go-runewidth
 # github.com/ncruces/go-strftime v1.0.0
@@ -92,12 +91,17 @@ go.yaml.in/yaml/v3
 # golang.org/x/arch v0.30.0
 ## explicit; go 1.25.0
 golang.org/x/arch/arm64/arm64asm
-# golang.org/x/crypto v0.55.0
-## explicit; go 1.25.0
+# golang.org/x/crypto v0.56.0
+## explicit; go 1.26.0
 golang.org/x/crypto/ocsp
 # golang.org/x/image v0.45.0
 ## explicit; go 1.25.0
 golang.org/x/image/ccitt
+golang.org/x/image/draw
+golang.org/x/image/font
+golang.org/x/image/font/basicfont
+golang.org/x/image/math/f64
+golang.org/x/image/math/fixed
 golang.org/x/image/riff
 golang.org/x/image/tiff/lzw
 golang.org/x/image/vp8
@@ -127,7 +131,7 @@ golang.org/x/text/width
 # howett.net/plist v1.0.1
 ## explicit; go 1.12
 howett.net/plist
-# modernc.org/libc v1.75.4
+# modernc.org/libc v1.75.7
 ## explicit; go 1.25.0
 modernc.org/libc
 modernc.org/libc/errno
@@ -161,7 +165,7 @@ modernc.org/mathutil
 # modernc.org/memory v1.12.1
 ## explicit; go 1.23.0
 modernc.org/memory
-# modernc.org/sqlite v1.57.0
+# modernc.org/sqlite v1.58.0
 ## explicit; go 1.25.0
 modernc.org/sqlite
 modernc.org/sqlite/lib

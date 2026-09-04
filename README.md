@@ -15,10 +15,12 @@ images, ruby, MathML, KVG/SVG, supported KFX styling, and supported audio,
 video, button, image-sequence, slideshow, scrollable, and zoomable plugins. PDFs retain title, authors, navigation, RTL
 direction, page dimensions, hyperlinks, high-resolution variants, and tiled
 images. Embedded PDF links with a missing or invalid local destination are
-removed before valid KFX links are rebuilt. CBZs retain original page bytes, reading order, and ComicBookInfo
-metadata unless privacy cleanup removes embedded media metadata. A complete
-embedded PDF remains byte-identical only when no KFX navigation, links,
-privacy cleanup, or other PDF-level enhancements must be applied. Mixed
+removed before valid KFX links are rebuilt. Every PDF is then normalized to a
+strict PDF 1.7, classic-xref compatibility profile that removes forms,
+signatures, active actions, attachments, thumbnails, and non-link annotations
+while preserving page content, outlines, metadata, and safe links. CBZs retain
+original page bytes and reading order and include ComicInfo.xml plus
+ComicBookInfo metadata. Mixed
 embedded-PDF and raster pages use a private, automatically removed target-local
 work directory. EPUB reconstruction fails closed instead of silently discarding
 HTML/webview, unknown interactive plugins, or conditional/magnification layouts.
@@ -42,6 +44,9 @@ support, but describes its KFX parity only as structural text/assets and does
 not provide the macOS reader credential path required here. JPEG-XR is
 rejected explicitly because no independently validated pure-Go decoder is
 currently suitable.
+
+The exact format profiles, independent validator gates, and Kindle-specific
+limits are documented in [docs/format-conformance.md](docs/format-conformance.md).
 
 Current limitation: newer vouchers may require a 40-character raw account
 secret. Reader 7.65 stores it as account `kindle.accountsecret.item`, service
@@ -93,6 +98,30 @@ Or build the single CLI once:
 CGO_ENABLED=0 go build -o leafport .
 ./leafport --target ./decrypted-books
 ```
+
+Override automatic selection for an image-backed fixed-layout title with
+`--format pdf`, `--format epub`, `--format cbz`, or `--format comic-epub`.
+Fixed-layout EPUB uses one XHTML document and JPEG image per page. EPUB cover
+metadata points at the cover already present on the first non-empty spine page;
+Leafport does not add a duplicate HTML cover. When usable source cover metadata
+is absent, that first non-empty page is the fallback: its first sufficiently
+large image is preferred, and its text is rasterized only when needed. PDF and
+CBZ page output applies the same declared-cover/first-non-empty ordering without
+duplicating an existing page.
+
+Validate an existing result without its KFX source, or create a normalized
+copy without modifying the original:
+
+```sh
+./leafport validate --input BOOK.epub
+./leafport fix --input ORIGINAL.pdf --output FIXED.pdf
+```
+
+`validate` and `fix` support PDF, EPUB, and CBZ. `fix` requires a different,
+nonexistent output path; it never edits or overwrites the input.
+For the full independent validator suite, including rotated PDF rendering and
+optional Amazon/Calibre delivery checks, see
+[`scripts/validate-publications.sh`](scripts/validate-publications.sh).
 
 Check discovery, registration, the installed build, runtime interfaces, crypto
 symbol ownership, and the prospective hook prologue without opening a book:
