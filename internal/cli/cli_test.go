@@ -18,6 +18,19 @@ func TestParseDefaults(t *testing.T) {
 	}
 }
 
+func TestParseExplicitFormat(t *testing.T) {
+	config, err := parse("leafport", []string{"--target", "/tmp/books", "--format", "comic-epub"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Format != "comic-epub" {
+		t.Fatalf("format = %q", config.Format)
+	}
+	if _, err := parse("leafport", []string{"--target", "/tmp/books", "--format", "mobi"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("unsupported format was accepted")
+	}
+}
+
 func TestParseDebugArtifacts(t *testing.T) {
 	config, err := parse("leafport", []string{"--target", "/tmp/books", "--debug"}, &bytes.Buffer{})
 	if err != nil {
@@ -125,6 +138,24 @@ func TestDoctorHelpUsesInjectedStreams(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "leafport doctor") {
 		t.Fatalf("help output = %q", stderr.String())
+	}
+}
+
+func TestPublicationCommandHelpAndNoOverwriteGuard(t *testing.T) {
+	for _, command := range []string{"validate", "fix"} {
+		var stdout, stderr bytes.Buffer
+		code := Run(context.Background(), []string{"leafport", command, "--help"},
+			strings.NewReader(""), &stdout, &stderr)
+		if code != 0 || !strings.Contains(stderr.String(), "Usage:") {
+			t.Fatalf("%s help: code=%d stderr=%q", command, code, stderr.String())
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{
+		"leafport", "fix", "--input", "/tmp/original.epub", "--output", "/tmp/original.epub",
+	}, strings.NewReader(""), &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "originals are never modified") {
+		t.Fatalf("same-path fix: code=%d stderr=%q", code, stderr.String())
 	}
 }
 

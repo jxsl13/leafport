@@ -2,6 +2,7 @@ package kfxconvert
 
 import (
 	"bytes"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -348,6 +349,139 @@ func TestEmbeddedPDFNonfunctionalLinksAreRemovedSelectively(t *testing.T) {
 	}
 }
 
+func TestNormalizePDFRemovesHiddenSignatureWidgetAndActiveState(t *testing.T) {
+	imageData := testPNG(t, 2, 2, color.Black)
+	var source bytes.Buffer
+	if err := api.ImportImages(nil, &source, []io.Reader{bytes.NewReader(imageData)}, nil, pdfConfiguration()); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	plainPath := filepath.Join(directory, "plain.pdf")
+	interactivePath := filepath.Join(directory, "interactive.pdf")
+	destination := filepath.Join(directory, "normalized.pdf")
+	if err := os.WriteFile(plainPath, source.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plain, err := os.Open(plainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context, err := api.ReadValidateAndOptimize(plain, pdfConfiguration())
+	if closeErr := plain.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := context.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root["AcroForm"] = types.Dict{"Fields": types.Array{}, "SigFlags": types.Integer(3)}
+	root["OpenAction"] = types.Dict{"S": types.Name("JavaScript"), "JS": types.StringLiteral("app.alert('x')")}
+	page, _, _, err := context.PageDict(1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page["Annots"] = types.Array{types.Dict{
+		"Type": types.Name("Annot"), "Subtype": types.Name("Widget"), "FT": types.Name("Sig"),
+		"Rect": types.Array{types.Integer(-10), types.Integer(-10), types.Integer(-10), types.Integer(-10)},
+	}}
+	if err := api.WriteContextFile(context, interactivePath); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NormalizePDF(interactivePath, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ActionsRemoved == 0 || result.AnnotationsRemoved != 1 || result.Pages != 1 {
+		t.Fatalf("normalization result = %+v", result)
+	}
+	if err := validateKindlePDF(destination); err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := os.Open(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalizedContext, err := api.ReadValidateAndOptimize(normalized, strictPDFConfiguration())
+	closeErr := normalized.Close()
+	if err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	if normalizedContext.HeaderVersion == nil || *normalizedContext.HeaderVersion != model.V17 ||
+		normalizedContext.RootVersion != nil || normalizedContext.Read.UsingXRefStreams ||
+		normalizedContext.Read.UsingObjectStreams || normalizedContext.Encrypt != nil {
+		t.Fatalf("normalized PDF profile = %s", normalizedContext)
+	}
+	if _, err := NormalizePDF(interactivePath, destination); err == nil {
+		t.Fatal("existing destination was overwritten")
+	}
+}
+
+func TestRepairPDFFontMetricsUsesDescriptorBoundingBox(t *testing.T) {
+	descriptor := types.Dict{
+		"Type":      types.Name("FontDescriptor"),
+		"FontBBox":  types.Array{types.Integer(-20), types.Integer(-210), types.Integer(1010), types.Integer(894)},
+		"Ascent":    types.Integer(0),
+		"CapHeight": types.Integer(0),
+		"Descent":   types.Integer(-206),
+	}
+	context := &model.Context{XRefTable: &model.XRefTable{Table: map[int]*model.XRefTableEntry{
+		7: model.NewXRefTableEntryGen0(descriptor),
+	}}}
+	repaired, err := repairPDFFontMetrics(context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired != 1 || descriptor.IntEntry("Ascent") == nil || *descriptor.IntEntry("Ascent") != 894 ||
+		descriptor.IntEntry("CapHeight") == nil || *descriptor.IntEntry("CapHeight") != 894 {
+		t.Fatalf("repaired descriptor = %v, count = %d", descriptor, repaired)
+	}
+	if err := validatePDFFontMetrics(context); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateKindlePDFRejectsActiveNameTrees(t *testing.T) {
+	imageData := testPNG(t, 2, 2, color.Black)
+	var source bytes.Buffer
+	if err := api.ImportImages(nil, &source, []io.Reader{bytes.NewReader(imageData)}, nil, pdfCompatibilityConfiguration()); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	plainPath := filepath.Join(directory, "plain.pdf")
+	activePath := filepath.Join(directory, "active.pdf")
+	if err := os.WriteFile(plainPath, source.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plain, err := os.Open(plainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context, err := api.ReadValidateAndOptimize(plain, pdfCompatibilityConfiguration())
+	closeErr := plain.Close()
+	if err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	root, err := context.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root["Names"] = types.Dict{"JavaScript": types.Dict{"Names": types.Array{
+		types.StringLiteral("script"), types.Dict{
+			"S": types.Name("JavaScript"), "JS": types.StringLiteral("app.alert('x')"),
+		},
+	}}}
+	if err := api.WriteContextFile(context, activePath); err != nil {
+		t.Fatal(err)
+	}
+	err = validateKindlePDF(activePath)
+	if err == nil || !strings.Contains(err.Error(), "JavaScript name tree") {
+		t.Fatalf("active name tree validation error = %v", err)
+	}
+}
+
 func TestImageFixedLayoutBecomesValidatedPDF(t *testing.T) {
 	page := func(width, height int) []byte {
 		var data bytes.Buffer
@@ -356,7 +490,10 @@ func TestImageFixedLayoutBecomesValidatedPDF(t *testing.T) {
 		}
 		return data.Bytes()
 	}
-	destination := filepath.Join(t.TempDir(), "images.pdf")
+	destination := os.Getenv("LEAFPORT_PDF_TEST_OUTPUT")
+	if destination == "" {
+		destination = filepath.Join(t.TempDir(), "images.pdf")
+	}
 	pages := []Page{
 		{ResourceID: 1, SectionID: 10, Format: 284, Location: "portrait.png", Data: page(20, 30)},
 		{ResourceID: 2, SectionID: 20, Format: 284, Location: "landscape.png", Data: page(40, 10)},

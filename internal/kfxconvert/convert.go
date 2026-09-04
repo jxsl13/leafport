@@ -24,6 +24,10 @@ type ConversionResult struct {
 // reconstructing the publication.
 type ConversionOptions struct {
 	Privacy PrivacyOptions
+	// Format selects the final publication format. Empty and "auto" retain
+	// Leafport's semantic format selection. Supported explicit values are
+	// "pdf", "epub", "cbz", and "comic-epub".
+	Format string
 }
 
 // FormatDecision explains the non-KFX output selected for a publication.
@@ -88,7 +92,10 @@ func convertBook(book *decodedBook, destinationBase string, metadata Metadata, o
 	if err != nil {
 		return ConversionResult{}, err
 	}
-	decision := chooseFormat(book, pages)
+	decision, err := requestedFormat(book, pages, options.Format)
+	if err != nil {
+		return ConversionResult{}, err
+	}
 	if decision.Format == "PDF" {
 		path := destinationBase + ".pdf"
 		result, convertErr := convertFixedLayoutPagesToPDF(book, pages, path, book.publicationMetadata(metadata))
@@ -111,6 +118,18 @@ func convertBook(book *decodedBook, destinationBase string, metadata Metadata, o
 			Privacy: privacy,
 		}, nil
 	}
+	if decision.Format == "EPUB-COMIC" || decision.Format == "EPUB-FXL" {
+		path := destinationBase + ".epub"
+		result, convertErr := convertImageLayoutPagesToEPUB(
+			book, pages, path, book.publicationMetadata(metadata), decision.Format == "EPUB-COMIC")
+		if convertErr != nil {
+			return ConversionResult{}, fmt.Errorf("reconstruct fixed-layout EPUB: %w", convertErr)
+		}
+		return ConversionResult{
+			Path: path, Format: decision.Format, Pages: result.Pages, Images: result.Images,
+			Sections: result.Pages, Privacy: privacy,
+		}, nil
+	}
 	path := destinationBase + ".epub"
 	result, err := convertBookToEPUB(book, path, metadata)
 	if err != nil {
@@ -120,6 +139,35 @@ func convertBook(book *decodedBook, destinationBase string, metadata Metadata, o
 		Path: path, Format: "EPUB", Sections: result.Sections, Images: result.Images, Media: result.Media, Fonts: result.Fonts,
 		Privacy: privacy,
 	}, nil
+}
+
+func requestedFormat(book *decodedBook, pages []Page, requested string) (FormatDecision, error) {
+	switch requested {
+	case "", "auto":
+		return chooseFormat(book, pages), nil
+	case "pdf":
+		if len(pages) == 0 {
+			return FormatDecision{}, fmt.Errorf("PDF output requires an image-backed fixed-layout publication")
+		}
+		return FormatDecision{Format: "PDF", Reason: "explicitly requested"}, nil
+	case "cbz":
+		if len(pages) == 0 {
+			return FormatDecision{}, fmt.Errorf("CBZ output requires an image-backed fixed-layout publication")
+		}
+		return FormatDecision{Format: "CBZ", Reason: "explicitly requested"}, nil
+	case "comic-epub":
+		if len(pages) == 0 {
+			return FormatDecision{}, fmt.Errorf("comic EPUB output requires an image-backed fixed-layout publication")
+		}
+		return FormatDecision{Format: "EPUB-COMIC", Reason: "explicitly requested"}, nil
+	case "epub":
+		if len(pages) != 0 {
+			return FormatDecision{Format: "EPUB-FXL", Reason: "explicitly requested for a fixed-layout publication"}, nil
+		}
+		return FormatDecision{Format: "EPUB", Reason: "explicitly requested"}, nil
+	default:
+		return FormatDecision{}, fmt.Errorf("unsupported output format %q", requested)
+	}
 }
 
 func chooseFormat(book *decodedBook, pages []Page) FormatDecision {

@@ -51,6 +51,10 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout, stder
 			return app.Doctor(ctx, config, app.Streams{Stdin: stdin, Stdout: stdout, Stderr: stderr})
 		case "debug":
 			return debugcmd.Run(ctx, arguments[2:], stdout, stderr)
+		case "validate":
+			return runPublicationValidate(arguments[0], arguments[2:], stdout, stderr)
+		case "fix":
+			return runPublicationFix(arguments[0], arguments[2:], stdout, stderr)
 		}
 	}
 	config, err := parse(arguments[0], arguments[1:], stderr)
@@ -63,10 +67,78 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout, stder
 	return app.Run(ctx, config, app.Streams{Stdin: stdin, Stdout: stdout, Stderr: stderr})
 }
 
+func runPublicationValidate(program string, arguments []string, stdout, stderr io.Writer) error {
+	var input string
+	flags := pflag.NewFlagSet(filepath.Base(program)+" validate", pflag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintf(flags.Output(), "Usage: %s validate --input BOOK.{pdf,epub,cbz}\n\n", filepath.Base(program))
+		flags.PrintDefaults()
+	}
+	flags.StringVarP(&input, "input", "i", "", "existing publication to validate")
+	if err := flags.Parse(arguments); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 || input == "" {
+		return errors.New("validate requires --input and accepts no positional arguments")
+	}
+	result, err := kfxconvert.ValidatePublication(input)
+	if err != nil {
+		return err
+	}
+	printPublicationSummary(stdout, "valid", input, result)
+	return nil
+}
+
+func runPublicationFix(program string, arguments []string, stdout, stderr io.Writer) error {
+	var input, output string
+	flags := pflag.NewFlagSet(filepath.Base(program)+" fix", pflag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintf(flags.Output(), "Usage: %s fix --input ORIGINAL --output COPY\n\n", filepath.Base(program))
+		flags.PrintDefaults()
+	}
+	flags.StringVarP(&input, "input", "i", "", "existing PDF, EPUB, or CBZ")
+	flags.StringVarP(&output, "output", "o", "", "new normalized copy (must not exist)")
+	if err := flags.Parse(arguments); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 || input == "" || output == "" {
+		return errors.New("fix requires --input and --output and accepts no positional arguments")
+	}
+	result, err := kfxconvert.FixPublication(input, output)
+	if err != nil {
+		return err
+	}
+	printPublicationSummary(stdout, "created", output, result)
+	return nil
+}
+
+func printPublicationSummary(output io.Writer, action, path string, result kfxconvert.PublicationValidationResult) {
+	details := ""
+	switch result.Format {
+	case "PDF":
+		details = fmt.Sprintf(", %d pages", result.Pages)
+	case "EPUB":
+		details = fmt.Sprintf(", %d spine items, %d images, %dx%d cover", result.SpineItems, result.Images,
+			result.CoverWidth, result.CoverHeight)
+	case "CBZ":
+		details = fmt.Sprintf(", %d decoded pages, ComicInfo.xml", result.Pages)
+	}
+	fmt.Fprintf(output, "%s %s: %s%s\n", action, result.Format, path, details)
+}
+
 func parse(program string, arguments []string, output io.Writer) (app.Config, error) {
 	config := app.Config{
 		AppPath:       "/Applications/Amazon Kindle.app",
 		Match:         ".*",
+		Format:        "auto",
 		AccountSecret: strings.TrimSpace(os.Getenv("LEAFPORT_ACCOUNT_SECRET")),
 	}
 	name := filepath.Base(program)
@@ -77,8 +149,10 @@ func parse(program string, arguments []string, output io.Writer) (app.Config, er
   %s --target DIRECTORY [--match REGEX] [--redact-personal] [--redact REGEX]
   %s --list [-o wide]
   %s doctor [--app PATH] [--library PATH]
+  %s validate --input BOOK.{pdf,epub,cbz}
+  %s fix --input ORIGINAL --output COPY
 
-`, name, name, name)
+`, name, name, name, name, name)
 		flags.PrintDefaults()
 		fmt.Fprintln(flags.Output(), "\nDiagnostics: doctor --help\nMaintenance: debug --help")
 	}
@@ -86,6 +160,7 @@ func parse(program string, arguments []string, output io.Writer) (app.Config, er
 	flags.StringVar(&config.Library, "library", "", "limit automatic search to this Kindle eBooks directory")
 	flags.BoolVar(&config.List, "list", false, "automatically find books and list their ASIN/ID")
 	flags.StringVar(&config.Match, "match", config.Match, "decrypt only titles/IDs matching this Go regular expression")
+	flags.StringVar(&config.Format, "format", config.Format, "final format: auto, pdf, epub, cbz, or comic-epub")
 	flags.StringVarP(&config.Output, "output", "o", "", "output format for --list (wide)")
 	flags.StringVar(&config.Target, "target", "", "required directory for decrypted books")
 	flags.BoolVar(&config.Debug, "debug", false, "retain encrypted bundles and decrypted KFX archives below TARGET/debug")
@@ -142,6 +217,14 @@ func validate(config app.Config) error {
 	}
 	if config.Output != "" && !config.List {
 		return errors.New("--output is only valid with --list")
+	}
+	switch config.Format {
+	case "auto", "pdf", "epub", "cbz", "comic-epub":
+	default:
+		return fmt.Errorf("unsupported --format %q (supported: auto, pdf, epub, cbz, comic-epub)", config.Format)
+	}
+	if config.List && config.Format != "auto" {
+		return errors.New("--format is only valid with --target")
 	}
 	if config.Output != "" && config.Output != "wide" {
 		return fmt.Errorf("unsupported --output format %q (supported: wide)", config.Output)

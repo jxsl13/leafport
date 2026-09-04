@@ -52,6 +52,7 @@ func convertFixedLayoutPagesToPDF(book *decodedBook, pages []Page, destination s
 	if len(pages) == 0 {
 		return result, errors.New("KFX publication is not image-backed fixed layout")
 	}
+	pages, _ = fixedLayoutPagesWithCover(book, pages)
 	allPDF, allImages := true, true
 	for index, page := range pages {
 		isPDF := page.Format == kfxPDFFormat && bytes.HasPrefix(page.Data, []byte("%PDF-"))
@@ -136,11 +137,9 @@ func convertFixedLayoutPagesToPDF(book *decodedBook, pages []Page, destination s
 		result.BrokenLinksRemoved = removedLinks
 		result.ExactCopy = false
 	}
-	if !result.ExactCopy {
-		if properties := pdfProperties(metadata); len(properties) != 0 {
-			if err = api.AddPropertiesFile(destination, "", properties, pdfConfiguration()); err != nil {
-				return result, fmt.Errorf("add PDF metadata: %w", err)
-			}
+	if properties := pdfProperties(metadata); len(properties) != 0 {
+		if err = api.AddPropertiesFile(destination, "", properties, pdfConfiguration()); err != nil {
+			return result, fmt.Errorf("add PDF metadata: %w", err)
 		}
 	}
 	if book != nil && book.pageProgressionDirection() == "rtl" {
@@ -161,6 +160,10 @@ func convertFixedLayoutPagesToPDF(book *decodedBook, pages []Page, destination s
 	} else if links != 0 {
 		result.ExactCopy = false
 	}
+	if _, err = normalizePDFFile(destination); err != nil {
+		return result, fmt.Errorf("normalize PDF for Kindle readers: %w", err)
+	}
+	result.ExactCopy = false
 	if bookmarks := pdfBookmarks(book, pages); len(bookmarks) != 0 {
 		if err = validatePDFBookmarks(destination, bookmarks); err != nil {
 			return result, err
@@ -283,6 +286,9 @@ func convertImageLayoutPagesToPDF(book *decodedBook, pages []Page, destination s
 			return result, fmt.Errorf("fixed-layout page %d (%q) has invalid %s dimensions %dx%d",
 				index+1, page.Location, format, configuration.Width, configuration.Height)
 		}
+		if dimensionErr := validateRasterDimensions(configuration.Width, configuration.Height, page.Location); dimensionErr != nil {
+			return result, dimensionErr
+		}
 		readers = append(readers, bytes.NewReader(page.Data))
 		locations[page.Location] = true
 	}
@@ -399,6 +405,9 @@ func writeReconstructedPDF(book *decodedBook, pages []Page, destination string, 
 	if _, err = addKFXPDFLinks(book, pages, destination); err != nil {
 		return err
 	}
+	if _, err = normalizePDFFile(destination); err != nil {
+		return fmt.Errorf("normalize PDF for Kindle readers: %w", err)
+	}
 	if bookmarks := pdfBookmarks(book, pages); len(bookmarks) != 0 {
 		if err = validatePDFBookmarks(destination, bookmarks); err != nil {
 			return err
@@ -444,7 +453,7 @@ func validatePDFBookmarks(path string, expected []pdfcpu.Bookmark) error {
 }
 
 func validateReconstructedPDF(path string, expectedPages int) error {
-	if err := api.ValidateFile(path, pdfConfiguration()); err != nil {
+	if err := api.ValidateFile(path, strictPDFConfiguration()); err != nil {
 		return fmt.Errorf("validate reconstructed PDF structure: %w", err)
 	}
 	file, err := os.Open(path)
@@ -460,6 +469,13 @@ func validateReconstructedPDF(path string, expectedPages int) error {
 		return fmt.Errorf("reconstructed PDF has %d pages; expected %d", pageCount, expectedPages)
 	}
 	return nil
+}
+
+func strictPDFConfiguration() *model.Configuration {
+	configuration := pdfCompatibilityConfiguration()
+	configuration.ValidationMode = model.ValidationStrict
+	configuration.ValidateLinks = false
+	return configuration
 }
 
 func pdfProperties(metadata Metadata) map[string]string {
